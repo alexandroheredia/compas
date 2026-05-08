@@ -1,6 +1,8 @@
 # compas
 
-> Ask, don't read.
+> Ask, don't read.   
+> TLDR: compas saves your agent from reading 3 or 4 extra irrelevant files every time it needs to understand your code. Saving you about 30% of tokens on code exploration and comprehension tasks.
+
 
 **compas** is a local semantic search engine for your codebase. It indexes your code using embeddings + AST analysis, then answers natural language queries like "where is authentication handled?" with ranked, relevant code snippets, complete with file paths, line numbers, and call relationships.
 

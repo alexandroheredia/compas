@@ -1,0 +1,363 @@
+# AI Agent Setup Guide for compas
+
+**Purpose:** This document is designed for AI agents to read and execute. It contains exact, copy-pasteable commands to set up compas from scratch. If you are a human reading this, the [README](../README.md) is more pleasant.
+
+---
+
+## What compas Does
+
+compas is a local semantic search engine for codebases. It indexes your code using embeddings + AST analysis, then exposes two MCP tools that you can call:
+
+1. **`search_codebase`**: Find code by natural language meaning (not just string matching)
+2. **`get_symbol_graph`**: See who calls what (call graph navigation)
+
+It runs entirely on the user's machine using Ollama (embeddings) and Qdrant (vector database).
+
+---
+
+## Prerequisites Check
+
+Before starting, verify these are installed and running:
+
+### 1. Rust
+
+```bash
+rustc --version
+# Expected: 1.75.0 or higher
+```
+
+If missing, install via [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+### 2. Docker (for Qdrant)
+
+```bash
+docker --version
+# Expected: any recent version
+```
+
+If missing, install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (macOS/Windows) or `docker.io` (Linux).
+
+### 3. Ollama (for embeddings)
+
+```bash
+ollama --version
+# Expected: any recent version
+```
+
+If missing, install from [ollama.com](https://ollama.com/):
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+### 4. Git
+
+```bash
+git --version
+```
+
+---
+
+## Step-by-Step Setup
+
+### Step 1: Clone and Build compas
+
+```bash
+# Clone the repository
+git clone https://github.com/alexandroheredia/compas.git
+cd compas
+
+# Build the release binary
+cargo build --release
+
+# Verify the binary exists
+ls -la target/release/compas
+```
+
+The binary path is: `{repo_root}/target/release/compas`
+(Example: `/Users/yourname/GitHub/compas/target/release/compas`)
+
+### Step 2: Start Qdrant
+
+```bash
+# In the compas repo directory
+docker compose up -d
+
+# Verify Qdrant is running
+curl http://localhost:6333
+# Expected: {"title":"qdrant - vector search engine"}
+```
+
+### Step 3: Pull the Embedding Model
+
+```bash
+ollama pull nomic-embed-text
+
+# Verify the model is available
+ollama list
+# Expected: nomic-embed-text in the list
+```
+
+### Step 4: Configure MCP in the Editor
+
+The compas binary exposes an MCP server over stdio. Configure your editor to launch it.
+
+#### VS Code
+
+Create or edit the MCP configuration file:
+
+**File:** `~/Library/Application Support/Code/User/mcp.json` (macOS)
+**File:** `%APPDATA%\Code\User\mcp.json` (Windows)
+**File:** `~/.config/Code/User/mcp.json` (Linux)
+
+```json
+{
+  "servers": {
+    "compas": {
+      "type": "stdio",
+      "command": "{path_to_compas_binary}",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Replace `{path_to_compas_binary}` with the absolute path from Step 1.
+
+Example:
+
+```json
+{
+  "servers": {
+    "compas": {
+      "type": "stdio",
+      "command": "/path/to/compas/target/release/compas",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+#### Claude Desktop
+
+Edit the Claude Desktop configuration:
+
+**File:** `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
+
+```json
+{
+  "mcpServers": {
+    "compas": {
+      "command": "{path_to_compas_binary}",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+#### Cursor
+
+Cursor reads the same MCP config as VS Code. Use the same `mcp.json` file location.
+
+### Step 5: Initialize a Repository
+
+Navigate to the project you want to index and run `compas init`:
+
+```bash
+cd /path/to/your/project
+{path_to_compas_binary} init
+```
+
+This creates two files:
+
+- `compas.yaml`: Configuration (language, include/exclude patterns)
+- `AGENTS.md`: Instructions for AI agents working in this repo
+
+It also registers the repo in the global registry at `~/.config/compas/repos.json`.
+
+### Step 6: Index the Repository
+
+```bash
+cd /path/to/your/project
+{path_to_compas_binary} index
+```
+
+Expected output (example):
+
+```
+Indexing /path/to/my-repo  (52 files, 0 changed, 0 deleted)
+
+     @@@@@@@   @@@@@@   @@@@@@@@@@   @@@@@@@    @@@@@@    @@@@@@
+     ...
+
+    my-repo indexed in 24s
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     52 changed  ·  0 skipped  ·  0 deleted
+     520 chunks  ·  0 failed
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ⚠️  107 symbols missing doc comments
+    🪦  21 dead code candidates
+
+    📊 Graph  → /path/to/my-repo/.compas/graph.json
+    📋 Audit  → .compas/audit.md
+```
+
+### Step 7: Start the Global Daemon (Optional)
+
+If you want REST API access or plan to query multiple repos:
+
+```bash
+{path_to_compas_binary} serve
+```
+
+Expected output:
+
+```
+Server running on http://127.0.0.1:3001
+```
+
+The daemon serves all registered repos. It auto-detects if another instance is running and replaces it.
+
+### Step 8: Verify Everything Works
+
+#### Test MCP
+
+If using VS Code, reload the window to pick up the new MCP config:
+
+```
+Cmd+Shift+P → "Developer: Reload Window"
+```
+
+Then ask your agent: "Search the codebase for authentication logic"
+
+The agent should call `search_codebase` and receive ranked results.
+
+#### Test REST API
+
+```bash
+# List registered repos
+curl http://localhost:3001/repos
+
+# Search a specific repo
+curl "http://localhost:3001/search?repo=your-repo-name&q=authentication"
+
+# Get call graph for a symbol
+curl "http://localhost:3001/graph?repo=your-repo-name&symbol=AuthService.login"
+```
+
+---
+
+## Multi-Repo Setup
+
+To index multiple repositories:
+
+```bash
+# Repo 1
+cd /path/to/repo1
+{path_to_compas_binary} init
+{path_to_compas_binary} index
+
+# Repo 2
+cd /path/to/repo2
+{path_to_compas_binary} init
+{path_to_compas_binary} index
+
+# Both are now served by the same daemon
+{path_to_compas_binary} serve
+```
+
+Query via REST with `?repo=` parameter:
+
+```bash
+curl "http://localhost:3001/search?repo=repo2&q=cache+logic"
+```
+
+Query via MCP with `repo` parameter:
+
+```json
+{
+  "query": "cache logic",
+  "repo": "repo2",
+  "limit": 10
+}
+```
+
+---
+
+## Troubleshooting
+
+### "repo 'X' not found"
+
+- The repo name is case-sensitive in the registry but case-insensitive in lookups (fixed in latest version)
+- Check available repos: `curl http://localhost:3001/repos`
+- Verify the repo was registered: `cat ~/.config/compas/repos.json`
+
+### "configuration file compas.yaml not found"
+
+- Run `compas init` in the repo root first
+- The MCP server no longer requires `compas.yaml` in cwd (loads from global registry)
+
+### Qdrant connection failed
+
+- Verify Docker is running: `docker ps`
+- Start Qdrant: `docker compose up -d` (in compas repo)
+- Check Qdrant health: `curl http://localhost:6333`
+
+### MCP server not starting
+
+- Verify the binary path in `mcp.json` is absolute and correct
+- Check binary permissions: `chmod +x target/release/compas`
+- Reload VS Code after any config changes
+
+### Search returns no results
+
+- Verify indexing completed: check `.compas/graph.json` exists
+- Check Qdrant collection exists: `curl http://localhost:6333/collections/{collection_name}`
+- Reindex if needed: `{path_to_compas_binary} index`
+
+---
+
+## File Reference
+
+| File                           | Purpose                                     |
+| ------------------------------ | ------------------------------------------- |
+| `~/.config/compas/repos.json`  | Global registry of initialized repos        |
+| `{repo}/compas.yaml`           | Per-repo configuration                      |
+| `{repo}/.compas/graph.json`    | Symbol call graph                           |
+| `{repo}/.compas/audit.md`      | Code quality report                         |
+| `{repo}/.compas/manifest.json` | Incremental indexing manifest (file hashes) |
+
+---
+
+## Quick Reference: compas Commands
+
+| Command        | Purpose                                                |
+| -------------- | ------------------------------------------------------ |
+| `compas init`  | Initialize a repo (creates config, registers globally) |
+| `compas index` | Index/reindex the current repo                         |
+| `compas serve` | Start the global REST daemon                           |
+| `compas mcp`   | Start the MCP stdio server                             |
+| `compas watch` | Watch files and auto-reindex (experimental)            |
+
+---
+
+## Environment Variables
+
+| Variable      | Default     | Purpose                                          |
+| ------------- | ----------- | ------------------------------------------------ |
+| `COMPAS_HOST` | `127.0.0.1` | REST server bind address                         |
+| `COMPAS_PORT` | `3001`      | REST server port                                 |
+| `RUST_LOG`    | unset       | Set to `info` for verbose logging (disables TUI) |
+
+---
+
+## Need Help?
+
+Open an issue on Github and let's talk.

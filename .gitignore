@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local repo config
+/compas.yaml
+
+# compas internal data
+.compas/
+
+docs/misc/
+CHANGES.md

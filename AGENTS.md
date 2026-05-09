@@ -2,6 +2,17 @@
 
 This file is for AI agents (and human collaborators) working on the `compas` codebase.
 
+## Critical Rules
+
+### Git Operations
+
+**NEVER perform git operations without explicit user approval.**
+
+- Do NOT run `git commit`, `git push`, `git add`, `git reset`, `git rebase`, or any git mutation command unless the user explicitly asks for it
+- Do NOT stage files, create branches, or merge without confirmation
+- Writing commit messages is fine — but deliver them as text for the user to copy, don't execute the commit yourself
+- The user controls the git history. Respect that boundary.
+
 ## Project Structure
 
 ```

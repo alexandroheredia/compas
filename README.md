@@ -133,7 +133,7 @@ Currently **Dart/Flutter** only. TypeScript and Python support is on the roadmap
 
 ## Roadmap
 
-- [ ] Ignore files with something like `.compasignore`
+- [x] Ignore files with something like `.compasignore`
 - [ ] TypeScript/JavaScript support
 - [ ] Python support
 - [ ] Graph-enriched chunk indexing

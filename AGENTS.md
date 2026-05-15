@@ -71,7 +71,11 @@ cargo clippy -- -W clippy::all
 cargo fmt
 ```
 
-> **Rule: After every code change, rebuild the app and iterate until the build succeeds.** Do not move on to the next task until `cargo build --release` (or `cargo build` if only running tests) completes without errors.
+> **Rule: After every code change, run the full hygiene cycle and iterate until everything passes.** Do not move on to the next task until all of these succeed:
+> 1. `cargo fmt` (format check)
+> 2. `cargo clippy -- -W clippy::all` (lint)
+> 3. `cargo build --release` (or `cargo build` if only running tests)
+> 4. `cargo test`
 
 ## Testing Workflow
 

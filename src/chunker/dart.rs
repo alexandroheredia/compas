@@ -793,7 +793,8 @@ pub fn extract_semantic_references(content: &str) -> Result<SemanticReferenceAna
             "function_signature" | "getter_signature" | "setter_signature" => {
                 if let Some(body) = child.next_named_sibling() {
                     if matches!(body.kind(), "function_body" | "constructor_body" | "block") {
-                        let caller = extract_name(child, content).unwrap_or_else(|| "unknown".into());
+                        let caller =
+                            extract_name(child, content).unwrap_or_else(|| "unknown".into());
                         for callee in collect_scoped_semantic_references(body, content) {
                             references.push((caller.clone(), callee));
                         }
@@ -840,7 +841,8 @@ pub fn extract_semantic_references(content: &str) -> Result<SemanticReferenceAna
                         }
                         if let (Some(sig), Some(body_node)) = (sig_node, func_body) {
                             let (inner_sig, kind_label) = unwrap_method_signature(&sig);
-                            let caller = semantic_member_name(inner_sig, kind_label, &class_name, content);
+                            let caller =
+                                semantic_member_name(inner_sig, kind_label, &class_name, content);
                             for callee in collect_scoped_semantic_references(body_node, content) {
                                 references.push((caller.clone(), callee));
                             }
@@ -883,7 +885,11 @@ pub fn extract_semantic_references(content: &str) -> Result<SemanticReferenceAna
 fn semantic_member_name(node: Node, kind_label: &str, class_name: &str, content: &str) -> String {
     match kind_label {
         "constructor" | "factory_constructor" => {
-            format!("{}.{}", class_name, extract_ctor_name(node, content, class_name))
+            format!(
+                "{}.{}",
+                class_name,
+                extract_ctor_name(node, content, class_name)
+            )
         }
         _ => {
             let name = extract_name(node, content).unwrap_or_else(|| "unknown".into());
@@ -1016,8 +1022,10 @@ fn push_unique_name(out: &mut Vec<String>, value: &str) {
 fn extract_key_types(content: &str) -> Vec<String> {
     static KEY_TYPE_RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = KEY_TYPE_RE.get_or_init(|| {
-        regex::Regex::new(r"\b(?:Map\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*,|Set\s*<\s*([A-Za-z_][A-Za-z0-9_]*))")
-            .unwrap()
+        regex::Regex::new(
+            r"\b(?:Map\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*,|Set\s*<\s*([A-Za-z_][A-Za-z0-9_]*))",
+        )
+        .unwrap()
     });
     let mut key_types = HashSet::new();
     for caps in re.captures_iter(content) {
@@ -1035,10 +1043,9 @@ fn extract_family_key_types(content: &str) -> HashSet<String> {
     static FAMILY_START_RE: OnceLock<regex::Regex> = OnceLock::new();
     static TYPE_NAME_RE: OnceLock<regex::Regex> = OnceLock::new();
 
-    let family_re =
-        FAMILY_START_RE.get_or_init(|| regex::Regex::new(r"\.family\s*<").unwrap());
-    let type_name_re = TYPE_NAME_RE
-        .get_or_init(|| regex::Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\??$").unwrap());
+    let family_re = FAMILY_START_RE.get_or_init(|| regex::Regex::new(r"\.family\s*<").unwrap());
+    let type_name_re =
+        TYPE_NAME_RE.get_or_init(|| regex::Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\??$").unwrap());
 
     let mut key_types = HashSet::new();
     for family_start in family_re.find_iter(content) {
@@ -1194,10 +1201,7 @@ fn extract_call_from_node(node: Node, content: &str, out: &mut Vec<String>) {
 /// receiver. This correctly splits flat AST sequences such as the children
 /// of `list_literal`, where multiple independent call expressions sit
 /// side-by-side without an enclosing wrapper node.
-fn segment_call_chains(
-    node: Node,
-    content: &str,
-) -> Vec<(Option<String>, Vec<String>, bool)> {
+fn segment_call_chains(node: Node, content: &str) -> Vec<(Option<String>, Vec<String>, bool)> {
     let mut segments: Vec<(Option<String>, Vec<String>, bool)> = Vec::new();
     let mut current: Option<(Option<String>, Vec<String>, bool)> = None;
 

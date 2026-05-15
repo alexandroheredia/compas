@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use compas::{
-    chunker::{dart::{extract_calls, extract_semantic_references}, ChunkerRegistry},
+    chunker::{
+        dart::{extract_calls, extract_semantic_references},
+        ChunkerRegistry,
+    },
     config::AppConfig,
     embedder::{ollama::OllamaEmbedder, EmbedMode, Embedder},
     graph::Graph,
@@ -500,7 +503,13 @@ fn normalize_import_uri(
         if Some(package) != package_name {
             return None;
         }
-        return Some(repo_path.join("lib").join(relative).to_string_lossy().to_string());
+        return Some(
+            repo_path
+                .join("lib")
+                .join(relative)
+                .to_string_lossy()
+                .to_string(),
+        );
     }
     Some(
         repo_path
@@ -552,15 +561,22 @@ fn build_audit_analysis(
         if let Ok(semantic) = extract_semantic_references(&content) {
             analysis
                 .references
-                .extend(semantic.references.into_iter().map(|(_, callee)| AuditReference {
-                    caller_file: path_str.clone(),
-                    callee,
-                }));
+                .extend(
+                    semantic
+                        .references
+                        .into_iter()
+                        .map(|(_, callee)| AuditReference {
+                            caller_file: path_str.clone(),
+                            callee,
+                        }),
+                );
             analysis.key_types.extend(semantic.key_types);
-            analysis.file_edges.extend(semantic.import_uris.into_iter().filter_map(|uri| {
-                normalize_import_uri(repo_path, file_path, &uri, repo_package_name.as_deref())
-                    .map(|target| (path_str.clone(), target))
-            }));
+            analysis
+                .file_edges
+                .extend(semantic.import_uris.into_iter().filter_map(|uri| {
+                    normalize_import_uri(repo_path, file_path, &uri, repo_package_name.as_deref())
+                        .map(|target| (path_str.clone(), target))
+                }));
         }
     }
 
@@ -572,7 +588,10 @@ fn build_audit_analysis(
 }
 
 #[allow(dead_code)]
-fn reachable_files(manifest: &std::collections::HashMap<String, String>, analysis: &AuditFileAnalysis) -> HashSet<String> {
+fn reachable_files(
+    manifest: &std::collections::HashMap<String, String>,
+    analysis: &AuditFileAnalysis,
+) -> HashSet<String> {
     let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
     for path in manifest.keys() {
         adjacency.entry(path.clone()).or_default();
@@ -633,9 +652,7 @@ fn resolve_reference_file(callee: &str, declarations: &[AuditDeclaration]) -> Op
         .map(|decl| decl.file.clone())
 }
 
-fn classify_dead_code_candidates(
-    analysis: &AuditFileAnalysis,
-) -> Vec<DeadCodeCandidate> {
+fn classify_dead_code_candidates(analysis: &AuditFileAnalysis) -> Vec<DeadCodeCandidate> {
     // Build a global bare-name set of every callee referenced anywhere.
     // If a name appears in any reference, every declaration with that bare name
     // is considered live. This is intentionally permissive: false negatives
@@ -678,7 +695,11 @@ fn classify_dead_code_candidates(
             .rsplit('.')
             .next()
             .unwrap_or(&declaration.symbol);
-        let enclosing_type = declaration.symbol.split('.').next().unwrap_or(&declaration.symbol);
+        let enclosing_type = declaration
+            .symbol
+            .split('.')
+            .next()
+            .unwrap_or(&declaration.symbol);
 
         // Hard suppressions: framework dispatch.
         if is_framework_dispatched(member_name) {
@@ -1820,7 +1841,10 @@ mod tests {
         };
 
         let candidates = classify_dead_code_candidates(&analysis);
-        assert!(candidates.is_empty(), "Expected `main` to be suppressed, got: {candidates:?}");
+        assert!(
+            candidates.is_empty(),
+            "Expected `main` to be suppressed, got: {candidates:?}"
+        );
     }
 
     #[test]
@@ -1896,7 +1920,11 @@ mod tests {
         };
 
         let candidates = classify_dead_code_candidates(&analysis);
-        assert_eq!(candidates.len(), 1, "Expected exactly one candidate, got: {candidates:?}");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "Expected exactly one candidate, got: {candidates:?}"
+        );
         assert_eq!(candidates[0].symbol, "AbandonedService.run");
     }
 
@@ -1915,7 +1943,10 @@ mod tests {
         };
 
         let candidates = classify_dead_code_candidates(&analysis);
-        assert!(candidates.is_empty(), "Expected no candidates, got: {candidates:?}");
+        assert!(
+            candidates.is_empty(),
+            "Expected no candidates, got: {candidates:?}"
+        );
     }
 
     #[test]

@@ -266,10 +266,9 @@ void topLevel() {
 
         let analysis = extract_semantic_references(code).unwrap();
         assert!(
-            analysis.references.contains(&(
-                "Product.render".to_string(),
-                "displayName".to_string(),
-            )),
+            analysis
+                .references
+                .contains(&("Product.render".to_string(), "displayName".to_string(),)),
             "Expected getter read to be recorded, got: {:?}",
             analysis.references
         );
@@ -286,7 +285,9 @@ void topLevel() {
         let chunker = DartChunker;
         let chunks = chunker.chunk("lib/product.dart", code).unwrap();
         assert!(
-            chunks.iter().any(|chunk| chunk.symbol == "Product.operator =="),
+            chunks
+                .iter()
+                .any(|chunk| chunk.symbol == "Product.operator =="),
             "Expected operator symbol, got: {:?}",
             chunks.iter().map(|c| c.symbol.clone()).collect::<Vec<_>>()
         );

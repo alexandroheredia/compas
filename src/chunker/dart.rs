@@ -3,10 +3,19 @@
 use crate::chunker::Chunker;
 use crate::models::Chunk;
 use anyhow::Result;
+use std::collections::HashSet;
+use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 use uuid::Uuid;
 
 const MAX_CHUNK_CHARS: usize = 6000;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticReferenceAnalysis {
+    pub references: Vec<(String, String)>,
+    pub key_types: Vec<String>,
+    pub import_uris: Vec<String>,
+}
 
 pub struct DartChunker;
 
@@ -57,6 +66,18 @@ fn path_filename(file_path: &str) -> String {
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| file_path.to_string())
+}
+
+fn init_parser() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = unsafe {
+        tree_sitter::Language::from_raw(std::mem::transmute::<
+            _,
+            unsafe extern "C" fn() -> *const tree_sitter::ffi::TSLanguage,
+        >(tree_sitter_dart::LANGUAGE.into_raw())())
+    };
+    parser.set_language(&language)?;
+    Ok(parser)
 }
 
 fn walk_top_level<'a>(root: &Node<'a>, content: &'a str, file_path: &str, chunks: &mut Vec<Chunk>) {
@@ -121,7 +142,10 @@ fn walk_top_level<'a>(root: &Node<'a>, content: &'a str, file_path: &str, chunks
             "variable_declaration"
             | "late_declaration"
             | "final_declaration"
-            | "const_declaration" => {
+            | "const_declaration"
+            | "static_final_declaration_list"
+            | "initialized_variable_declaration"
+            | "top_level_variable_declaration" => {
                 let name = extract_name_from_var(child, content)
                     .unwrap_or_else(|| path_filename(file_path));
                 let text = node_text(child, content);
@@ -595,6 +619,9 @@ fn extract_name(node: Node, content: &str) -> Option<String> {
         if child.kind() == "identifier" {
             return Some(content[child.start_byte()..child.end_byte()].to_string());
         }
+        if let Some(operator_name) = extract_operator_name(child, content) {
+            return Some(operator_name);
+        }
         // Recurse one level for wrapper nodes like method_signature > function_signature > identifier
         if child.kind() == "function_signature"
             || child.kind() == "method_signature"
@@ -610,16 +637,33 @@ fn extract_name(node: Node, content: &str) -> Option<String> {
                         content[inner_child.start_byte()..inner_child.end_byte()].to_string(),
                     );
                 }
+                if let Some(operator_name) = extract_operator_name(inner_child, content) {
+                    return Some(operator_name);
+                }
             }
         }
     }
     None
 }
 
+fn extract_operator_name(node: Node, content: &str) -> Option<String> {
+    static OPERATOR_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let text = content[node.start_byte()..node.end_byte()].trim();
+    if !text.contains("operator") {
+        return None;
+    }
+    OPERATOR_RE
+        .get_or_init(|| regex::Regex::new(r"\boperator\s+([^\s(]+)").unwrap())
+        .captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|m| format!("operator {}", m.as_str()))
+}
+
 fn extract_name_from_var(node: Node, content: &str) -> Option<String> {
     for child in node.children(&mut node.walk()) {
         if child.kind() == "initialized_variable_definition"
             || child.kind() == "initialized_identifier"
+            || child.kind() == "static_final_declaration"
             || child.kind() == "identifier"
         {
             return extract_name(child, content);
@@ -647,15 +691,7 @@ fn extract_name_from_var(node: Node, content: &str) -> Option<String> {
 }
 
 pub fn extract_calls(content: &str) -> Result<Vec<(String, String)>> {
-    let mut parser = Parser::new();
-    let language = unsafe {
-        tree_sitter::Language::from_raw(std::mem::transmute::<
-            _,
-            unsafe extern "C" fn() -> *const tree_sitter::ffi::TSLanguage,
-        >(tree_sitter_dart::LANGUAGE.into_raw())())
-    };
-    parser.set_language(&language)?;
-
+    let mut parser = init_parser()?;
     let tree = parser
         .parse(content, None)
         .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
@@ -676,6 +712,21 @@ pub fn extract_calls(content: &str) -> Result<Vec<(String, String)>> {
                         for callee in callees {
                             calls.push((caller.clone(), callee));
                         }
+                    }
+                }
+            }
+            "variable_declaration"
+            | "late_declaration"
+            | "final_declaration"
+            | "const_declaration"
+            | "static_final_declaration_list"
+            | "initialized_variable_declaration"
+            | "top_level_variable_declaration" => {
+                if let Some(name) = extract_name_from_var(child, content) {
+                    let mut callees = vec![];
+                    collect_callees_in_scope(child, content, &mut callees);
+                    for callee in callees {
+                        calls.push((name.clone(), callee));
                     }
                 }
             }
@@ -728,6 +779,346 @@ pub fn extract_calls(content: &str) -> Result<Vec<(String, String)>> {
     Ok(calls)
 }
 
+pub fn extract_semantic_references(content: &str) -> Result<SemanticReferenceAnalysis> {
+    let mut parser = init_parser()?;
+    let tree = parser
+        .parse(content, None)
+        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+    let root = tree.root_node();
+    let mut references = vec![];
+
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "function_signature" | "getter_signature" | "setter_signature" => {
+                if let Some(body) = child.next_named_sibling() {
+                    if matches!(body.kind(), "function_body" | "constructor_body" | "block") {
+                        let caller =
+                            extract_name(child, content).unwrap_or_else(|| "unknown".into());
+                        for callee in collect_scoped_semantic_references(body, content) {
+                            references.push((caller.clone(), callee));
+                        }
+                    }
+                }
+            }
+            "variable_declaration"
+            | "late_declaration"
+            | "final_declaration"
+            | "const_declaration"
+            | "static_final_declaration_list"
+            | "initialized_variable_declaration"
+            | "top_level_variable_declaration" => {
+                if let Some(name) = extract_name_from_var(child, content) {
+                    for callee in collect_scoped_semantic_references(child, content) {
+                        references.push((name.clone(), callee));
+                    }
+                }
+            }
+            "class_declaration" | "mixin_declaration" | "extension_declaration" => {
+                let class_name =
+                    extract_name(child, content).unwrap_or_else(|| "AnonymousClass".into());
+                if let Some(body) = find_child(&child, "class_body") {
+                    let mut body_cursor = body.walk();
+                    for member in body.children(&mut body_cursor) {
+                        if member.kind() != "class_member" {
+                            continue;
+                        }
+                        let mut sig_node: Option<Node> = None;
+                        let mut func_body: Option<Node> = None;
+                        let mut member_cursor = member.walk();
+                        for mchild in member.children(&mut member_cursor) {
+                            match mchild.kind() {
+                                "method_signature"
+                                | "constructor_signature"
+                                | "getter_signature"
+                                | "setter_signature"
+                                | "function_signature" => sig_node = Some(mchild),
+                                "function_body" | "constructor_body" | "block" => {
+                                    func_body = Some(mchild)
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let (Some(sig), Some(body_node)) = (sig_node, func_body) {
+                            let (inner_sig, kind_label) = unwrap_method_signature(&sig);
+                            let caller =
+                                semantic_member_name(inner_sig, kind_label, &class_name, content);
+                            for callee in collect_scoped_semantic_references(body_node, content) {
+                                references.push((caller.clone(), callee));
+                            }
+                        }
+
+                        let mut field_node: Option<Node> = None;
+                        let mut member_cursor = member.walk();
+                        for mchild in member.children(&mut member_cursor) {
+                            match mchild.kind() {
+                                "field_declaration"
+                                | "variable_declaration"
+                                | "late_declaration"
+                                | "final_declaration"
+                                | "const_declaration" => field_node = Some(mchild),
+                                _ => {}
+                            }
+                        }
+                        if let Some(field) = field_node {
+                            if let Some(field_name) = extract_name_from_var(field, content) {
+                                let caller = format!("{}.{}", class_name, field_name);
+                                for callee in collect_scoped_semantic_references(field, content) {
+                                    references.push((caller.clone(), callee));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(SemanticReferenceAnalysis {
+        references,
+        key_types: extract_key_types(content),
+        import_uris: extract_import_uris(content),
+    })
+}
+
+fn semantic_member_name(node: Node, kind_label: &str, class_name: &str, content: &str) -> String {
+    match kind_label {
+        "constructor" | "factory_constructor" => {
+            format!(
+                "{}.{}",
+                class_name,
+                extract_ctor_name(node, content, class_name)
+            )
+        }
+        _ => {
+            let name = extract_name(node, content).unwrap_or_else(|| "unknown".into());
+            format!("{}.{}", class_name, name)
+        }
+    }
+}
+
+fn collect_scoped_semantic_references(node: Node, content: &str) -> Vec<String> {
+    let mut refs = vec![];
+    collect_semantic_references_in_scope(node, content, &mut refs);
+    refs
+}
+
+fn collect_semantic_references_in_scope(node: Node, content: &str, out: &mut Vec<String>) {
+    extract_property_read_from_node(node, content, out);
+    extract_identifier_read_from_node(node, content, out);
+    extract_call_from_node(node, content, out);
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let child_kind = child.kind();
+        if child_kind == "class_definition"
+            || child_kind == "class_declaration"
+            || child_kind == "mixin_declaration"
+            || child_kind == "extension_declaration"
+        {
+            continue;
+        }
+        collect_semantic_references_in_scope(child, content, out);
+    }
+}
+
+fn extract_property_read_from_node(node: Node, content: &str, out: &mut Vec<String>) {
+    for (receiver, method_chain, has_call) in segment_call_chains(node, content) {
+        if has_call || method_chain.is_empty() {
+            continue;
+        }
+        let property_name = if let Some(recv) = receiver {
+            if recv
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+            {
+                format!("{}.{}", recv, method_chain.last().unwrap())
+            } else {
+                method_chain.last().unwrap().clone()
+            }
+        } else {
+            method_chain.last().unwrap().clone()
+        };
+        push_unique_name(out, &property_name);
+    }
+}
+
+fn extract_identifier_read_from_node(node: Node, content: &str, out: &mut Vec<String>) {
+    if node.kind() != "identifier" || !should_capture_identifier_read(&node) {
+        return;
+    }
+
+    let name = content[node.start_byte()..node.end_byte()].to_string();
+    push_unique_name(out, &name);
+}
+
+fn should_capture_identifier_read(node: &Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    if matches!(
+        parent.kind(),
+        "function_signature"
+            | "method_signature"
+            | "constructor_signature"
+            | "factory_constructor_signature"
+            | "getter_signature"
+            | "setter_signature"
+            | "class_definition"
+            | "class_declaration"
+            | "mixin_declaration"
+            | "extension_declaration"
+            | "enum_declaration"
+            | "type_identifier"
+            | "type_arguments"
+            | "type_parameter"
+            | "formal_parameter"
+            | "simple_formal_parameter"
+            | "super_formal_parameter"
+            | "field_formal_parameter"
+            | "label"
+            | "annotation"
+            | "unconditional_assignable_selector"
+            | "conditional_assignable_selector"
+            | "import_directive"
+            | "export_directive"
+    ) {
+        return false;
+    }
+
+    if matches!(
+        parent.kind(),
+        "initialized_variable_definition"
+            | "initialized_identifier"
+            | "static_final_declaration"
+            | "named_argument"
+    ) {
+        return !is_first_named_child(node, &parent);
+    }
+
+    true
+}
+
+fn is_first_named_child(node: &Node, parent: &Node) -> bool {
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if child.is_named() {
+            return child.id() == node.id();
+        }
+    }
+    false
+}
+
+fn push_unique_name(out: &mut Vec<String>, value: &str) {
+    if !out.iter().any(|existing| existing == value) {
+        out.push(value.to_string());
+    }
+}
+
+fn extract_key_types(content: &str) -> Vec<String> {
+    static KEY_TYPE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = KEY_TYPE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\b(?:Map\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*,|Set\s*<\s*([A-Za-z_][A-Za-z0-9_]*))",
+        )
+        .unwrap()
+    });
+    let mut key_types = HashSet::new();
+    for caps in re.captures_iter(content) {
+        if let Some(name) = caps.get(1).or_else(|| caps.get(2)) {
+            key_types.insert(name.as_str().to_string());
+        }
+    }
+    key_types.extend(extract_family_key_types(content));
+    let mut key_types: Vec<String> = key_types.into_iter().collect();
+    key_types.sort();
+    key_types
+}
+
+fn extract_family_key_types(content: &str) -> HashSet<String> {
+    static FAMILY_START_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static TYPE_NAME_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+    let family_re = FAMILY_START_RE.get_or_init(|| regex::Regex::new(r"\.family\s*<").unwrap());
+    let type_name_re =
+        TYPE_NAME_RE.get_or_init(|| regex::Regex::new(r"([A-Za-z_][A-Za-z0-9_]*)\??$").unwrap());
+
+    let mut key_types = HashSet::new();
+    for family_start in family_re.find_iter(content) {
+        let start = family_start.end();
+        let Some(end) = find_matching_angle_bracket(content, start) else {
+            continue;
+        };
+        let generic_args = &content[start..end];
+        let Some(last_arg) = split_top_level_last_arg(generic_args) else {
+            continue;
+        };
+        if let Some(type_name) = type_name_re
+            .captures(last_arg.trim())
+            .and_then(|caps| caps.get(1))
+        {
+            key_types.insert(type_name.as_str().to_string());
+        }
+    }
+
+    key_types
+}
+
+fn find_matching_angle_bracket(content: &str, start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    for (offset, ch) in content[start..].char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_last_arg(args: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut last_comma = None;
+    for (offset, ch) in args.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => last_comma = Some(offset),
+            _ => {}
+        }
+    }
+    let comma = last_comma?;
+    Some(args[comma + 1..].trim())
+}
+
+fn extract_import_uris(content: &str) -> Vec<String> {
+    static URI_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = URI_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?m)^\s*(?:import|export|part)\s+['\"]([^'\"]+)['\"]"#).unwrap()
+    });
+    let mut uris = HashSet::new();
+    for caps in re.captures_iter(content) {
+        if let Some(uri) = caps.get(1) {
+            let value = uri.as_str();
+            if !value.starts_with("dart:") {
+                uris.insert(value.to_string());
+            }
+        }
+    }
+    let mut uris: Vec<String> = uris.into_iter().collect();
+    uris.sort();
+    uris
+}
+
 /// Collect callee identifiers within a function/method body.
 /// Does NOT recurse into nested function definitions.
 fn collect_callees_in_scope(node: Node, content: &str, out: &mut Vec<String>) {
@@ -758,29 +1149,100 @@ fn collect_callees_in_scope(node: Node, content: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Extract a single call from a node that contains the call pattern:
-/// identifier + selector(assignable) + selector(argument_part)
+/// Extract calls from a node by partitioning sibling children into individual
+/// expression segments. Handles flat sequences like `list_literal` containing
+/// `identifier selector(.foo) selector((args)) identifier selector(.bar) ...`
+/// where multiple call expressions are siblings rather than nested.
 fn extract_call_from_node(node: Node, content: &str, out: &mut Vec<String>) {
-    let mut receiver: Option<String> = None;
-    let mut method_chain: Vec<String> = Vec::new();
-    let mut has_call = false;
+    for (receiver, method_chain, has_call) in segment_call_chains(node, content) {
+        if !has_call {
+            continue;
+        }
+        if let Some(recv) = receiver {
+            if recv
+                .chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+                && !method_chain.is_empty()
+            {
+                let qualified = format!("{}.{}", recv, method_chain.last().unwrap());
+                if !out.contains(&qualified) {
+                    out.push(qualified);
+                }
+            } else if !method_chain.is_empty() {
+                let method = method_chain.last().unwrap();
+                if !out.contains(method) {
+                    out.push(method.clone());
+                }
+            } else {
+                if !out.contains(&recv) {
+                    out.push(recv);
+                }
+            }
+        } else if !method_chain.is_empty() {
+            let method = method_chain.last().unwrap();
+            if !out.contains(method) {
+                out.push(method.clone());
+            }
+        }
+    }
+}
+
+/// Walk a node's direct children and partition them into call/access "segments".
+/// Each segment is `(receiver, method_chain, has_call)`:
+///   - `receiver`: optional leading identifier (lowercase var or uppercase type).
+///     `None` for chains starting with `this`/`super` or implicit receivers.
+///   - `method_chain`: ordered identifiers from `.foo.bar.baz` selectors.
+///   - `has_call`: true if any selector in the chain contained `argument_part`.
+///
+/// A new segment begins whenever a fresh `identifier`/`this`/`super` appears
+/// after we have already consumed at least one selector or seen a previous
+/// receiver. This correctly splits flat AST sequences such as the children
+/// of `list_literal`, where multiple independent call expressions sit
+/// side-by-side without an enclosing wrapper node.
+fn segment_call_chains(node: Node, content: &str) -> Vec<(Option<String>, Vec<String>, bool)> {
+    let mut segments: Vec<(Option<String>, Vec<String>, bool)> = Vec::new();
+    let mut current: Option<(Option<String>, Vec<String>, bool)> = None;
+
+    let flush = |cur: &mut Option<(Option<String>, Vec<String>, bool)>,
+                 segs: &mut Vec<(Option<String>, Vec<String>, bool)>| {
+        if let Some(seg) = cur.take() {
+            if seg.0.is_some() || !seg.1.is_empty() {
+                segs.push(seg);
+            }
+        }
+    };
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "identifier" if receiver.is_none() => {
-                receiver = Some(content[child.start_byte()..child.end_byte()].to_string());
+            "identifier" => {
+                let name = content[child.start_byte()..child.end_byte()].to_string();
+                if current
+                    .as_ref()
+                    .map(|s| s.0.is_some() || !s.1.is_empty())
+                    .unwrap_or(false)
+                {
+                    flush(&mut current, &mut segments);
+                }
+                current = Some((Some(name), Vec::new(), false));
             }
-            "identifier" => {}
             "this" | "super" => {
-                // Object reference - receiver is implicit (we don't know the class name here)
+                if current
+                    .as_ref()
+                    .map(|s| s.0.is_some() || !s.1.is_empty())
+                    .unwrap_or(false)
+                {
+                    flush(&mut current, &mut segments);
+                }
+                current = Some((None, Vec::new(), false));
             }
             "selector" => {
-                // Check if this selector contains an argument_part (i.e., it's a call)
+                let seg = current.get_or_insert_with(|| (None, Vec::new(), false));
                 if has_argument_part(child) {
-                    has_call = true;
+                    seg.2 = true;
                 }
-                // Extract method names from assignable selectors like `.doThing`
                 let mut sel_cursor = child.walk();
                 for sel_child in child.children(&mut sel_cursor) {
                     if sel_child.kind() == "unconditional_assignable_selector"
@@ -789,53 +1251,26 @@ fn extract_call_from_node(node: Node, content: &str, out: &mut Vec<String>) {
                         let mut inner = sel_child.walk();
                         for inner_child in sel_child.children(&mut inner) {
                             if inner_child.kind() == "identifier" {
-                                let name = content
-                                    [inner_child.start_byte()..inner_child.end_byte()]
-                                    .to_string();
-                                method_chain.push(name);
+                                seg.1.push(
+                                    content[inner_child.start_byte()..inner_child.end_byte()]
+                                        .to_string(),
+                                );
                             }
                         }
                     }
                 }
+                if seg.2 {
+                    flush(&mut current, &mut segments);
+                }
+            }
+            "," => {
+                flush(&mut current, &mut segments);
             }
             _ => {}
         }
     }
-
-    if has_call {
-        if let Some(ref recv) = receiver {
-            if recv
-                .chars()
-                .next()
-                .map(|c| c.is_uppercase())
-                .unwrap_or(false)
-                && !method_chain.is_empty()
-            {
-                // Static call: BookStatusUtils.getStatusIcon(...)
-                let qualified = format!("{}.{}", recv, method_chain.last().unwrap());
-                if !out.contains(&qualified) {
-                    out.push(qualified);
-                }
-            } else if !method_chain.is_empty() {
-                // Instance call on variable: book.fromJson(...) -> record "fromJson"
-                let method = method_chain.last().unwrap();
-                if !out.contains(method) {
-                    out.push(method.clone());
-                }
-            } else {
-                // Direct function call: print(...)
-                if !out.contains(recv) {
-                    out.push(recv.clone());
-                }
-            }
-        } else if !method_chain.is_empty() {
-            // this.doThing(...) or cascade - record just the method name
-            let method = method_chain.last().unwrap();
-            if !out.contains(method) {
-                out.push(method.clone());
-            }
-        }
-    }
+    flush(&mut current, &mut segments);
+    segments
 }
 
 fn has_argument_part(node: Node) -> bool {

@@ -16,11 +16,11 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language query describing what you are looking for (e.g. 'user authentication', 'image caching', 'database models')" },
-                    "limit": { "type": "number", "description": "Maximum number of results to return (default: 5)" },
+                    "limit": { "type": "number", "description": "Maximum number of results to return (default: 10)" },
                     "language": { "type": "string", "description": "Optional language filter, e.g. 'dart'" },
-                    "repo": { "type": "string", "description": "Optional repo name (e.g. 'my-app'). Only needed if the daemon serves multiple repos." }
+                    "repo": { "type": "string", "description": "Repository name (e.g. 'my-app'). Always pass this to avoid cwd auto-detection failures." }
                 },
-                "required": ["query"]
+                "required": ["query", "repo"]
             }),
         },
         ToolDefinition {
@@ -31,9 +31,9 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "symbol": { "type": "string", "description": "Name of the function, method, or class to analyze (e.g. 'AuthService.login', 'CacheService', 'getUserById')" },
                     "file": { "type": "string", "description": "Optional file path to disambiguate symbols with the same name, e.g. 'lib/services/auth_service.dart'" },
-                    "repo": { "type": "string", "description": "Optional repo name (e.g. 'my-app'). Only needed if the daemon serves multiple repos." }
+                    "repo": { "type": "string", "description": "Repository name (e.g. 'my-app'). Always pass this to avoid cwd auto-detection failures." }
                 },
-                "required": ["symbol"]
+                "required": ["symbol", "repo"]
             }),
         },
     ]

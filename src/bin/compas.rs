@@ -154,9 +154,9 @@ enum Commands {
     Index,
     /// Optimize the local edge shard
     Optimize,
-    /// Start the REST server
+    /// Start the HTTP daemon for REST, eval scripts, and multi-repo access
     Serve,
-    /// Start the MCP stdio server for agent integration
+    /// Start the MCP stdio tool server for editors and AI agents
     Mcp,
     /// Watch files and auto-reindex
     Watch,

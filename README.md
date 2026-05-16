@@ -48,6 +48,13 @@ curl "http://localhost:3001/search?q=how+does+caching+work"
 
 ## MCP Integration
 
+`compas` has two different runtime modes:
+
+- `compas mcp`: the stdio tool server used by editors and AI agents
+- `compas serve`: the HTTP daemon used for REST, scripts, evals, and multi-repo access
+
+If you are setting up an editor integration, you usually want `compas mcp`. If you want `curl`, the evaluation script, or one long-lived daemon serving multiple repos, use `compas serve`.
+
 Add to your editor's MCP config:
 
 **VS Code** (`~/Library/Application Support/Code/User/mcp.json`):
@@ -104,6 +111,8 @@ curl "http://localhost:3001/search?repo=repo-b&q=cache"
 ```
 
 Repos are registered in `~/.config/compas/repos.json`.
+
+This is separate from MCP: your editor can launch `compas mcp` for tool calls while `compas serve` is running for HTTP access and daemon-backed fallback.
 
 ## How It Works
 

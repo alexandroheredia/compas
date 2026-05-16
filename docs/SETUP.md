@@ -208,6 +208,13 @@ Server running on http://127.0.0.1:3001
 
 The daemon serves all registered repos. It auto-detects if another instance is running and replaces it.
 
+Important distinction:
+
+- `compas serve` = HTTP daemon on port 3001 for REST, scripts, evals, and multi-repo access
+- `compas mcp` = stdio tool server used by editors/agents via MCP
+
+If you only need editor/agent tool calls, your editor will usually launch `compas mcp` for you from the MCP config. You do not normally need to type `compas mcp` by hand.
+
 ### Step 7: Verify Everything Works
 
 #### Test MCP
@@ -321,8 +328,8 @@ Query via MCP with `repo` parameter:
 | `compas init`  | Initialize a repo (creates config, registers globally) |
 | `compas index` | Index/reindex the current repo                         |
 | `compas optimize` | Optimize the embedded edge shard                    |
-| `compas serve` | Start the global REST daemon                           |
-| `compas mcp`   | Start the MCP stdio server                             |
+| `compas serve` | Start the HTTP daemon for REST, scripts, evals, and multi-repo access |
+| `compas mcp`   | Start the MCP stdio tool server used by editors and AI agents |
 | `compas watch` | Watch files and auto-reindex (experimental)            |
 
 ---

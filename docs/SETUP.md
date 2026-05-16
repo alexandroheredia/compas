@@ -11,7 +11,7 @@ compas is a local semantic search engine for codebases. It indexes your code usi
 1. **`search_codebase`**: Find code by natural language meaning (not just string matching)
 2. **`get_symbol_graph`**: See who calls what (call graph navigation)
 
-It runs entirely on the user's machine using Ollama (embeddings) and Qdrant (vector database).
+It runs entirely on the user's machine using Ollama (embeddings) and embedded Qdrant Edge (vector database).
 
 ---
 
@@ -33,16 +33,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
 
-### 2. Docker (for Qdrant)
-
-```bash
-docker --version
-# Expected: any recent version
-```
-
-If missing, install [Docker Desktop](https://www.docker.com/products/docker-desktop/) (macOS/Windows) or `docker.io` (Linux).
-
-### 3. Ollama (for embeddings)
+### 2. Ollama (for embeddings)
 
 ```bash
 ollama --version
@@ -55,7 +46,7 @@ If missing, install from [ollama.com](https://ollama.com/):
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-### 4. Git
+### 3. Git
 
 ```bash
 git --version
@@ -82,18 +73,7 @@ ls -la target/release/compas
 The binary path is: `{repo_root}/target/release/compas`
 (Example: `/Users/yourname/GitHub/compas/target/release/compas`)
 
-### Step 2: Start Qdrant
-
-```bash
-# In the compas repo directory
-docker compose up -d
-
-# Verify Qdrant is running
-curl http://localhost:6333
-# Expected: {"title":"qdrant - vector search engine"}
-```
-
-### Step 3: Pull the Embedding Model
+### Step 2: Pull the Embedding Model
 
 ```bash
 ollama pull nomic-embed-text
@@ -103,7 +83,7 @@ ollama list
 # Expected: nomic-embed-text in the list
 ```
 
-### Step 4: Configure MCP in the Editor
+### Step 3: Configure MCP in the Editor
 
 The compas binary exposes an MCP server over stdio. Configure your editor to launch it.
 
@@ -164,7 +144,7 @@ Edit the Claude Desktop configuration:
 
 Cursor reads the same MCP config as VS Code. Use the same `mcp.json` file location.
 
-### Step 5: Initialize a Repository
+### Step 4: Initialize a Repository
 
 Navigate to the project you want to index and run `compas init`:
 
@@ -180,7 +160,7 @@ This creates two files:
 
 It also registers the repo in the global registry at `~/.config/compas/repos.json`.
 
-### Step 6: Index the Repository
+### Step 5: Index the Repository
 
 ```bash
 cd /path/to/your/project
@@ -207,9 +187,12 @@ Indexing /path/to/my-repo  (52 files, 0 changed, 0 deleted)
 
     📊 Graph  → /path/to/my-repo/.compas/graph.json
     📋 Audit  → .compas/audit.md
+
+Optimizing edge shard...
+✓ Edge shard optimized
 ```
 
-### Step 7: Start the Global Daemon (Optional)
+### Step 6: Start the Global Daemon (Optional)
 
 If you want REST API access or plan to query multiple repos:
 
@@ -225,7 +208,7 @@ Server running on http://127.0.0.1:3001
 
 The daemon serves all registered repos. It auto-detects if another instance is running and replaces it.
 
-### Step 8: Verify Everything Works
+### Step 7: Verify Everything Works
 
 #### Test MCP
 
@@ -304,12 +287,6 @@ Query via MCP with `repo` parameter:
 - Run `compas init` in the repo root first
 - The MCP server no longer requires `compas.yaml` in cwd (loads from global registry)
 
-### Qdrant connection failed
-
-- Verify Docker is running: `docker ps`
-- Start Qdrant: `docker compose up -d` (in compas repo)
-- Check Qdrant health: `curl http://localhost:6333`
-
 ### MCP server not starting
 
 - Verify the binary path in `mcp.json` is absolute and correct
@@ -319,7 +296,7 @@ Query via MCP with `repo` parameter:
 ### Search returns no results
 
 - Verify indexing completed: check `.compas/graph.json` exists
-- Check Qdrant collection exists: `curl http://localhost:6333/collections/{collection_name}`
+- Verify the shard exists: check `{repo}/.compas/edge-shard/`
 - Reindex if needed: `{path_to_compas_binary} index`
 
 ---
@@ -330,6 +307,7 @@ Query via MCP with `repo` parameter:
 | ------------------------------ | ------------------------------------------- |
 | `~/.config/compas/repos.json`  | Global registry of initialized repos        |
 | `{repo}/compas.yaml`           | Per-repo configuration                      |
+| `{repo}/.compas/edge-shard/`   | Embedded Qdrant Edge shard                  |
 | `{repo}/.compas/graph.json`    | Symbol call graph                           |
 | `{repo}/.compas/audit.md`      | Code quality report                         |
 | `{repo}/.compas/manifest.json` | Incremental indexing manifest (file hashes) |
@@ -342,6 +320,7 @@ Query via MCP with `repo` parameter:
 | -------------- | ------------------------------------------------------ |
 | `compas init`  | Initialize a repo (creates config, registers globally) |
 | `compas index` | Index/reindex the current repo                         |
+| `compas optimize` | Optimize the embedded edge shard                    |
 | `compas serve` | Start the global REST daemon                           |
 | `compas mcp`   | Start the MCP stdio server                             |
 | `compas watch` | Watch files and auto-reindex (experimental)            |

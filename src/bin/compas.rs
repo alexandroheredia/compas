@@ -10,7 +10,7 @@ use compas::{
     graph::Graph,
     mcp::{self, state::McpAppState},
     server::{router, AppState, RepoState},
-    store::{qdrant::QdrantStore, Store},
+    store::{edge::EdgeStore, Store},
     watcher::{FileWatcher, Handler},
 };
 use indicatif::{ProgressBar, ProgressStyle};
@@ -152,6 +152,8 @@ enum Commands {
     Init,
     /// Index the repository
     Index,
+    /// Optimize the local edge shard
+    Optimize,
     /// Start the REST server
     Serve,
     /// Start the MCP stdio server for agent integration
@@ -173,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
             let config = AppConfig::load(cli.config.to_str().unwrap())?;
             match cmd {
                 Commands::Index => index_repo(config).await,
+                Commands::Optimize => optimize_repo(config).await,
                 Commands::Watch => watch(config).await,
                 Commands::Init | Commands::Serve | Commands::Mcp => unreachable!(),
             }
@@ -272,8 +275,6 @@ fn init_repo() -> anyhow::Result<()> {
         ),
     };
 
-    let collection = repo_name.to_lowercase().replace(' ', "_").to_string();
-
     let yaml = format!(
         r#"repo:
   path: .
@@ -288,9 +289,9 @@ embedder:
   url: http://localhost:11434
 
 store:
-  provider: qdrant
-  url: http://localhost:6333
-  collection: {}
+  provider: edge
+  path: .compas/edge-shard
+  vector_name: default
 
 server:
   host: 127.0.0.1
@@ -310,7 +311,6 @@ index:
             .map(|s| format!("    - \"{}\"", s))
             .collect::<Vec<_>>()
             .join("\n"),
-        collection,
     );
 
     std::fs::write(&config_path, yaml)?;
@@ -387,10 +387,9 @@ Only skip if you already know the **exact file path and line number**.
     println!("Created compas.yaml in {:?}", cwd);
     println!("Detected language: {}", dominant.unwrap_or("unknown"));
     println!("\nNext steps:");
-    println!("  1. Start Qdrant:  docker-compose up -d");
-    println!("  2. Start Ollama:  ollama serve");
-    println!("  3. Index repo:    compas index");
-    println!("  4. Start server:  compas serve");
+    println!("  1. Start Ollama:  ollama serve");
+    println!("  2. Index repo:    compas index");
+    println!("  3. Start server:  compas serve");
     println!("\nTo make 'compas' available everywhere, copy the binary to your PATH:");
     println!("  cp /path/to/compas/target/release/compas /usr/local/bin/");
 
@@ -777,9 +776,10 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         config.embedder.query_prefix.clone().unwrap_or_default(),
         config.embedder.doc_prefix.clone().unwrap_or_default(),
     ));
-    let store = Arc::new(QdrantStore::new(
-        &config.store.url,
-        &config.store.collection,
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let store = Arc::new(EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
     ));
     store.init(embedder.dimensions()).await?;
 
@@ -787,8 +787,6 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     let chunker = registry
         .get("dart")
         .ok_or_else(|| anyhow::anyhow!("no dart chunker"))?;
-
-    let repo_path = std::fs::canonicalize(&config.repo.path)?;
 
     // Load .compasignore patterns
     let compas_ignore = CompasIgnore::load(&repo_path);
@@ -1215,7 +1213,41 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     if !use_tui {
         info!("indexing complete");
     }
+
+    println!("Optimizing edge shard...");
+    let optimized = store.optimize()?;
+    if optimized {
+        println!("✓ Edge shard optimized");
+    } else {
+        println!("✓ Edge shard already optimized");
+    }
+
     Ok(())
+}
+
+async fn optimize_repo(config: AppConfig) -> anyhow::Result<()> {
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let optimized = optimize_edge_shard(&config)?;
+
+    if optimized {
+        println!("Optimized edge shard for {}", repo_path.display());
+    } else {
+        println!(
+            "Edge shard for {} did not require optimization",
+            repo_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn optimize_edge_shard(config: &AppConfig) -> anyhow::Result<bool> {
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let store = EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
+    );
+    store.optimize()
 }
 
 async fn run_mcp() -> anyhow::Result<()> {
@@ -1245,9 +1277,10 @@ async fn run_mcp() -> anyhow::Result<()> {
             }
         };
 
-        let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-            &config.store.url,
-            &config.store.collection,
+        let repo_path = std::fs::canonicalize(path)?;
+        let store: Arc<dyn compas::store::Store> = Arc::new(EdgeStore::new(
+            repo_path.join(&config.store.path),
+            &config.store.vector_name,
         ));
         let graph = Arc::new(Graph::new());
         let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
@@ -1256,8 +1289,6 @@ async fn run_mcp() -> anyhow::Result<()> {
             config.embedder.query_prefix.clone().unwrap_or_default(),
             config.embedder.doc_prefix.clone().unwrap_or_default(),
         ));
-
-        let repo_path = std::fs::canonicalize(path)?;
         let graph_path = repo_path.join(".compas").join("graph.json");
         if let Err(e) = graph.load(&graph_path) {
             warn!("no existing graph loaded for repo '{}': {}", name, e);
@@ -1320,9 +1351,10 @@ async fn serve() -> anyhow::Result<()> {
             }
         };
 
-        let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-            &config.store.url,
-            &config.store.collection,
+        let repo_path = std::fs::canonicalize(path)?;
+        let store: Arc<dyn compas::store::Store> = Arc::new(EdgeStore::new(
+            repo_path.join(&config.store.path),
+            &config.store.vector_name,
         ));
         let graph = Arc::new(Graph::new());
         let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
@@ -1331,8 +1363,6 @@ async fn serve() -> anyhow::Result<()> {
             config.embedder.query_prefix.clone().unwrap_or_default(),
             config.embedder.doc_prefix.clone().unwrap_or_default(),
         ));
-
-        let repo_path = std::fs::canonicalize(path)?;
         let graph_path = repo_path.join(".compas").join("graph.json");
         if let Err(e) = graph.load(&graph_path) {
             warn!("no existing graph loaded for repo '{}': {}", name, e);
@@ -1402,9 +1432,9 @@ async fn serve() -> anyhow::Result<()> {
 
 async fn watch(config: AppConfig) -> anyhow::Result<()> {
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
-    let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-        &config.store.url,
-        &config.store.collection,
+    let store: Arc<dyn compas::store::Store> = Arc::new(EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
     ));
     let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
         &config.embedder.url,
@@ -1756,6 +1786,69 @@ fn should_include(path: &std::path::Path, include: &[String], exclude: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::post, Json, Router};
+    use serde_json::{json, Value};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("compas-cli-test-{name}-{nanos}"))
+    }
+
+    fn embedding_for(text: &str) -> Vec<f32> {
+        let lower = text.to_lowercase();
+        let mut embedding = vec![0.0; 768];
+        if lower.contains("auth") || lower.contains("authentication") || lower.contains("login") {
+            embedding[0] = 1.0;
+        } else if lower.contains("cache") {
+            embedding[1] = 1.0;
+        } else {
+            embedding[2] = 1.0;
+        }
+        embedding
+    }
+
+    async fn start_mock_ollama() -> (String, tokio::task::JoinHandle<()>) {
+        async fn embed_handler(Json(payload): Json<Value>) -> Json<Value> {
+            let inputs = payload["input"].as_array().cloned().unwrap_or_default();
+            let embeddings: Vec<Vec<f32>> = inputs
+                .iter()
+                .map(|value| embedding_for(value.as_str().unwrap_or_default()))
+                .collect();
+            Json(json!({ "embeddings": embeddings }))
+        }
+
+        let app = Router::new().route("/api/embed", post(embed_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn wait_for_server(port: &str) {
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/health");
+        for _ in 0..50 {
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("server did not become ready on port {port}");
+    }
 
     fn decl(file: &str, symbol: &str, kind: &str) -> AuditDeclaration {
         AuditDeclaration {
@@ -2010,5 +2103,95 @@ mod tests {
 
         assert!(reachable.contains("/repo/lib/main.dart"));
         assert!(reachable.contains("/repo/lib/core/providers/provider_auth.dart"));
+    }
+
+    #[tokio::test]
+    async fn test_init_index_and_search_over_http() {
+        let _guard = test_lock().lock().unwrap();
+
+        let repo_dir = unique_temp_path("repo");
+        let home_dir = unique_temp_path("home");
+        std::fs::create_dir_all(repo_dir.join("lib")).unwrap();
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::write(
+            repo_dir.join("lib").join("auth_service.dart"),
+            r#"class AuthService {
+  Future<String> login(String email, String password) async {
+    return email;
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_port = std::env::var_os("COMPAS_PORT");
+
+        let (mock_url, mock_handle) = start_mock_ollama().await;
+        let port = ((SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            % 1000)
+            + 31000)
+            .to_string();
+
+        std::env::set_current_dir(&repo_dir).unwrap();
+        std::env::set_var("HOME", &home_dir);
+        std::env::set_var("COMPAS_PORT", &port);
+
+        init_repo().unwrap();
+
+        let config_path = repo_dir.join("compas.yaml");
+        let config_text = std::fs::read_to_string(&config_path).unwrap();
+        let updated = config_text.replace("http://localhost:11434", &mock_url);
+        std::fs::write(&config_path, updated).unwrap();
+
+        let config = AppConfig::load(config_path.to_str().unwrap()).unwrap();
+        index_repo(config).await.unwrap();
+
+        let serve_handle = tokio::spawn(async { serve().await.unwrap() });
+        wait_for_server(&port).await;
+
+        let response: Value =
+            reqwest::get(format!("http://127.0.0.1:{port}/search?q=authentication"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+
+        let results = response["results"].as_array().unwrap();
+        assert!(
+            !results.is_empty(),
+            "expected search results, got {response}"
+        );
+        let symbols: Vec<&str> = results
+            .iter()
+            .filter_map(|result| result["chunk"]["symbol"].as_str())
+            .collect();
+        assert!(
+            symbols.contains(&"AuthService") || symbols.contains(&"AuthService.login"),
+            "expected auth symbols in results, got {symbols:?}"
+        );
+
+        serve_handle.abort();
+        let _ = serve_handle.await;
+        mock_handle.abort();
+        let _ = mock_handle.await;
+
+        std::env::set_current_dir(original_dir).unwrap();
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_port {
+            Some(value) => std::env::set_var("COMPAS_PORT", value),
+            None => std::env::remove_var("COMPAS_PORT"),
+        }
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+        std::fs::remove_dir_all(&home_dir).unwrap();
     }
 }

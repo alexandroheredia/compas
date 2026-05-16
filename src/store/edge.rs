@@ -311,3 +311,151 @@ fn parse_json_path(path: &str) -> Result<JsonPath> {
     path.parse()
         .map_err(|_| anyhow!("invalid edge payload path '{}'", path))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Chunk;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_shard_path(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("compas-edge-{test_name}-{nanos}"))
+    }
+
+    fn sample_chunk(id: &str, file_path: &str, symbol: &str, language: &str) -> Chunk {
+        Chunk {
+            id: id.to_string(),
+            content: format!("{symbol} body"),
+            language: language.to_string(),
+            file_path: file_path.to_string(),
+            symbol: symbol.to_string(),
+            line_start: 1,
+            line_end: 5,
+            kind: "method".to_string(),
+            meta: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_store_upsert_search_delete_and_reload() {
+        let shard_path = temp_shard_path("lifecycle");
+        let store = EdgeStore::new(&shard_path, "default");
+        store.init(4).await.unwrap();
+
+        let chunks = vec![
+            sample_chunk(
+                "11111111-1111-1111-1111-111111111111",
+                "/tmp/lib/auth.dart",
+                "AuthService.login",
+                "dart",
+            ),
+            sample_chunk(
+                "22222222-2222-2222-2222-222222222222",
+                "/tmp/lib/cache.dart",
+                "CacheService.save",
+                "dart",
+            ),
+        ];
+        let embeddings = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
+
+        store.upsert(&chunks, &embeddings).await.unwrap();
+
+        let results = store
+            .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].chunk.id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(results[0].chunk.symbol, "AuthService.login");
+
+        store.delete_by_file("/tmp/lib/auth.dart").await.unwrap();
+
+        let remaining = store
+            .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].chunk.file_path, "/tmp/lib/cache.dart");
+
+        drop(store);
+
+        let reopened = EdgeStore::new(&shard_path, "default");
+        let persisted = reopened
+            .search(&[0.0, 1.0, 0.0, 0.0], 5, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].chunk.symbol, "CacheService.save");
+
+        drop(reopened);
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_search_respects_filters() {
+        let shard_path = temp_shard_path("filters");
+        let store = EdgeStore::new(&shard_path, "default");
+        store.init(4).await.unwrap();
+
+        let chunks = vec![
+            sample_chunk(
+                "33333333-3333-3333-3333-333333333333",
+                "/tmp/lib/auth.dart",
+                "AuthService.login",
+                "dart",
+            ),
+            sample_chunk(
+                "44444444-4444-4444-4444-444444444444",
+                "/tmp/src/auth.rs",
+                "AuthService::login",
+                "rust",
+            ),
+        ];
+        let embeddings = vec![vec![0.8, 0.2, 0.0, 0.0], vec![0.8, 0.2, 0.0, 0.0]];
+        store.upsert(&chunks, &embeddings).await.unwrap();
+
+        let mut filters = HashMap::new();
+        filters.insert("language".to_string(), "dart".to_string());
+
+        let results = store
+            .search(&[0.8, 0.2, 0.0, 0.0], 5, &filters)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.language, "dart");
+        assert_eq!(results[0].chunk.file_path, "/tmp/lib/auth.dart");
+
+        drop(store);
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_rejects_non_uuid_or_numeric_chunk_ids() {
+        let shard_path = temp_shard_path("invalid-id");
+        let store = EdgeStore::new(&shard_path, "default");
+        store.init(4).await.unwrap();
+
+        let chunk = sample_chunk(
+            "not-a-valid-point-id",
+            "/tmp/lib/auth.dart",
+            "Bad.id",
+            "dart",
+        );
+        let err = store
+            .upsert(&[chunk], &[vec![1.0, 0.0, 0.0, 0.0]])
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("is not a valid Qdrant Edge point id"));
+
+        drop(store);
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+}

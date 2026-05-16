@@ -34,10 +34,6 @@ pub struct EmbedderConfig {
 pub struct StoreConfig {
     pub provider: String,
     #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub collection: String,
-    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub vector_name: String,
@@ -76,12 +72,6 @@ impl AppConfig {
         }
         if cfg.store.provider.is_empty() {
             cfg.store.provider = "edge".into();
-        }
-        if cfg.store.url.is_empty() {
-            cfg.store.url = "http://localhost:6333".into();
-        }
-        if cfg.store.collection.is_empty() {
-            cfg.store.collection = "compas".into();
         }
         if cfg.store.path.is_empty() {
             cfg.store.path = ".compas/edge-shard".into();

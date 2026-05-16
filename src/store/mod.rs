@@ -16,4 +16,3 @@ pub trait Store: Send + Sync {
 }
 
 pub mod edge;
-pub mod qdrant;

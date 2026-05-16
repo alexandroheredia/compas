@@ -10,8 +10,8 @@ git clone https://github.com/alexandroheredia/compas.git
 cd compas
 
 # 2. Install dependencies
-docker compose up -d    # Qdrant
 ollama pull nomic-embed-text
+ollama serve
 
 # 3. Build
 cargo build --release

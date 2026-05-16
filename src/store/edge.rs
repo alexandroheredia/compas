@@ -88,6 +88,18 @@ impl Store for EdgeStore {
             )
         })?;
 
+        let expected_config = self.edge_config(vector_size);
+        let has_existing_data = std::fs::read_dir(&self.shard_path)
+            .with_context(|| {
+                format!(
+                    "failed to inspect edge shard directory at {}",
+                    self.shard_path.display()
+                )
+            })?
+            .next()
+            .transpose()?
+            .is_some();
+
         let mut guard = self
             .shard
             .lock()
@@ -97,16 +109,27 @@ impl Store for EdgeStore {
             return Ok(());
         }
 
-        let shard = match EdgeShard::load(&self.shard_path, None) {
-            Ok(shard) => shard,
-            Err(_) => EdgeShard::new(&self.shard_path, self.edge_config(vector_size))
+        let shard = if has_existing_data {
+            EdgeShard::load(&self.shard_path, Some(expected_config))
+                .map_err(edge_error)
+                .with_context(|| {
+                    format!(
+                        "existing edge shard at {} is incompatible with vector '{}' and dimension {}. Delete {} and reindex if the embedding model or vector name changed",
+                        self.shard_path.display(),
+                        self.vector_name,
+                        vector_size,
+                        self.shard_path.display()
+                    )
+                })?
+        } else {
+            EdgeShard::new(&self.shard_path, expected_config)
                 .map_err(edge_error)
                 .with_context(|| {
                     format!(
                         "failed to initialize edge shard at {}",
                         self.shard_path.display()
                     )
-                })?,
+                })?
         };
 
         *guard = Some(shard);
@@ -454,6 +477,106 @@ mod tests {
         assert!(err
             .to_string()
             .contains("is not a valid Qdrant Edge point id"));
+
+        drop(store);
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_rejects_incompatible_vector_size() {
+        let shard_path = temp_shard_path("vector-size-mismatch");
+        let store = EdgeStore::new(&shard_path, "default");
+        store.init(4).await.unwrap();
+        drop(store);
+
+        let reopened = EdgeStore::new(&shard_path, "default");
+        let err = reopened.init(8).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("incompatible with vector 'default' and dimension 8"));
+
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_rejects_incompatible_vector_name() {
+        let shard_path = temp_shard_path("vector-name-mismatch");
+        let store = EdgeStore::new(&shard_path, "default");
+        store.init(4).await.unwrap();
+        drop(store);
+
+        let reopened = EdgeStore::new(&shard_path, "secondary");
+        let err = reopened.init(4).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("incompatible with vector 'secondary' and dimension 4"));
+
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_handles_large_batch_and_optimize() {
+        let shard_path = temp_shard_path("large-batch");
+        let store = EdgeStore::new(&shard_path, "default");
+        store.init(4).await.unwrap();
+
+        let chunks: Vec<Chunk> = (0..128)
+            .map(|index| {
+                sample_chunk(
+                    &format!("00000000-0000-0000-0000-{:012}", index + 1),
+                    &format!("/tmp/lib/file_{index}.dart"),
+                    &format!("Service{index}.run"),
+                    "dart",
+                )
+            })
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..128)
+            .map(|index| vec![1.0, index as f32 / 128.0, 0.0, 0.0])
+            .collect();
+
+        store.upsert(&chunks, &embeddings).await.unwrap();
+        let _ = store.optimize().unwrap();
+
+        let results = store
+            .search(&[1.0, 0.0, 0.0, 0.0], 10, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 10);
+
+        drop(store);
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_supports_concurrent_searches() {
+        let shard_path = temp_shard_path("concurrent-search");
+        let store = Arc::new(EdgeStore::new(&shard_path, "default"));
+        store.init(4).await.unwrap();
+
+        let chunks = vec![sample_chunk(
+            "55555555-5555-5555-5555-555555555555",
+            "/tmp/lib/auth.dart",
+            "AuthService.login",
+            "dart",
+        )];
+        let embeddings = vec![vec![1.0, 0.0, 0.0, 0.0]];
+        store.upsert(&chunks, &embeddings).await.unwrap();
+
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    store
+                        .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        for task in tasks {
+            let results = task.await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].chunk.symbol, "AuthService.login");
+        }
 
         drop(store);
         fs::remove_dir_all(shard_path).unwrap();

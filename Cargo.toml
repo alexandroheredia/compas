@@ -1,6 +1,6 @@
 [package]
 name = "compas"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Alexandro Heredia <alexandro@heredia.fi>"]
 description = "Local-first semantic search engine for codebases"

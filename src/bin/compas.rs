@@ -1278,17 +1278,20 @@ async fn run_mcp() -> anyhow::Result<()> {
         };
 
         let repo_path = std::fs::canonicalize(path)?;
-        let store: Arc<dyn compas::store::Store> = Arc::new(EdgeStore::new(
-            repo_path.join(&config.store.path),
-            &config.store.vector_name,
-        ));
-        let graph = Arc::new(Graph::new());
-        let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
+        let embedder = Arc::new(OllamaEmbedder::new(
             &config.embedder.url,
             &config.embedder.model,
             config.embedder.query_prefix.clone().unwrap_or_default(),
             config.embedder.doc_prefix.clone().unwrap_or_default(),
         ));
+        let edge_store = Arc::new(EdgeStore::new(
+            repo_path.join(&config.store.path),
+            &config.store.vector_name,
+        ));
+        edge_store.init(embedder.dimensions()).await?;
+        let store: Arc<dyn compas::store::Store> = edge_store;
+        let graph = Arc::new(Graph::new());
+        let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
         let graph_path = repo_path.join(".compas").join("graph.json");
         if let Err(e) = graph.load(&graph_path) {
             warn!("no existing graph loaded for repo '{}': {}", name, e);
@@ -1352,17 +1355,20 @@ async fn serve() -> anyhow::Result<()> {
         };
 
         let repo_path = std::fs::canonicalize(path)?;
-        let store: Arc<dyn compas::store::Store> = Arc::new(EdgeStore::new(
-            repo_path.join(&config.store.path),
-            &config.store.vector_name,
-        ));
-        let graph = Arc::new(Graph::new());
-        let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
+        let embedder = Arc::new(OllamaEmbedder::new(
             &config.embedder.url,
             &config.embedder.model,
             config.embedder.query_prefix.clone().unwrap_or_default(),
             config.embedder.doc_prefix.clone().unwrap_or_default(),
         ));
+        let edge_store = Arc::new(EdgeStore::new(
+            repo_path.join(&config.store.path),
+            &config.store.vector_name,
+        ));
+        edge_store.init(embedder.dimensions()).await?;
+        let store: Arc<dyn compas::store::Store> = edge_store;
+        let graph = Arc::new(Graph::new());
+        let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
         let graph_path = repo_path.join(".compas").join("graph.json");
         if let Err(e) = graph.load(&graph_path) {
             warn!("no existing graph loaded for repo '{}': {}", name, e);
@@ -1432,16 +1438,19 @@ async fn serve() -> anyhow::Result<()> {
 
 async fn watch(config: AppConfig) -> anyhow::Result<()> {
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
-    let store: Arc<dyn compas::store::Store> = Arc::new(EdgeStore::new(
-        repo_path.join(&config.store.path),
-        &config.store.vector_name,
-    ));
-    let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
+    let embedder = Arc::new(OllamaEmbedder::new(
         &config.embedder.url,
         &config.embedder.model,
         config.embedder.query_prefix.clone().unwrap_or_default(),
         config.embedder.doc_prefix.clone().unwrap_or_default(),
     ));
+    let edge_store = Arc::new(EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
+    ));
+    edge_store.init(embedder.dimensions()).await?;
+    let store: Arc<dyn compas::store::Store> = edge_store;
+    let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
     let handler = ReindexHandler {
         config,
         store,
@@ -2193,5 +2202,61 @@ mod tests {
 
         std::fs::remove_dir_all(&repo_dir).unwrap();
         std::fs::remove_dir_all(&home_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_optimize_edge_shard_succeeds_for_initialized_repo() {
+        let repo_dir = unique_temp_path("optimize");
+        std::fs::create_dir_all(repo_dir.join(".compas")).unwrap();
+
+        let config = AppConfig {
+            repo: compas::config::RepoConfig {
+                path: repo_dir.to_string_lossy().to_string(),
+                include: vec!["lib/**/*.dart".into()],
+                exclude: vec![],
+            },
+            embedder: compas::config::EmbedderConfig {
+                provider: "ollama".into(),
+                model: "nomic-embed-text".into(),
+                url: "http://localhost:11434".into(),
+                query_prefix: None,
+                doc_prefix: None,
+            },
+            store: compas::config::StoreConfig {
+                provider: "edge".into(),
+                path: ".compas/edge-shard".into(),
+                vector_name: "default".into(),
+            },
+            server: compas::config::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: "3001".into(),
+            },
+            index: compas::config::IndexConfig {
+                chunk_by: "function".into(),
+                watch: true,
+            },
+        };
+
+        let store = EdgeStore::new(repo_dir.join(&config.store.path), &config.store.vector_name);
+        store.init(4).await.unwrap();
+        drop(store);
+
+        let _ = optimize_edge_shard(&config).unwrap();
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+    }
+
+    #[test]
+    fn test_watch_include_patterns_match_nested_dart_files() {
+        assert!(should_include(
+            Path::new("lib/services/auth_service.dart"),
+            &["lib/**/*.dart".into()],
+            &[]
+        ));
+        assert!(!should_include(
+            Path::new("build/generated/auth_service.g.dart"),
+            &["lib/**/*.dart".into()],
+            &["**/*.g.dart".into(), "build/**".into()]
+        ));
     }
 }

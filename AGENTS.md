@@ -4,6 +4,11 @@ This file is for AI agents (and human collaborators) working on the `compas` cod
 
 ## Critical Rules
 
+### Communication
+
+- When explaining technical behavior to the user, prefer plain language first.
+- Explain what happened, why it matters, and what was verified in simple terms.
+
 ### Git Operations
 
 **NEVER perform git operations without explicit user approval.**

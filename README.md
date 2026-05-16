@@ -6,7 +6,7 @@
 
 **compas** is a local semantic search engine for your codebase. It indexes your code using embeddings + AST analysis, then answers natural language queries like "where is authentication handled?" with ranked, relevant code snippets, complete with file paths, line numbers, and call relationships.
 
-It runs entirely on your machine (Ollama + Qdrant) and exposes its capabilities via MCP so AI agents (Copilot, Claude, Cursor) can search your code without burning tokens on irrelevant files.
+It runs entirely on your machine (Ollama + embedded Qdrant Edge) and exposes its capabilities via MCP so AI agents (Copilot, Claude, Cursor) can search your code without burning tokens on irrelevant files.
 
 > **For AI agents setting this up:** Read [`docs/SETUP.md`](docs/SETUP.md) - exact, copy-pasteable commands.
 
@@ -21,31 +21,28 @@ Both are exposed as MCP tools that agents call directly.
 
 ## Quick Start
 
-**Prerequisites:** Rust 1.75+, Docker, Ollama
+**Prerequisites:** Rust 1.75+, Ollama
 
 ```bash
-# 1. Start Qdrant
-docker compose up -d
-
-# 2. Pull embedding model
+# 1. Pull embedding model
 ollama pull nomic-embed-text
 
-# 3. Build
+# 2. Build
 git clone https://github.com/alexandroheredia/compas.git
 cd compas
 cargo build --release
 
-# 4. Initialize a project
+# 3. Initialize a project
 cd your-project
 /path/to/compas/target/release/compas init
 
-# 5. Index
+# 4. Index
 /path/to/compas/target/release/compas index
 
-# 6. Start daemon
+# 5. Start daemon
 /path/to/compas/target/release/compas serve
 
-# 7. Query
+# 6. Query
 curl "http://localhost:3001/search?q=how+does+caching+work"
 ```
 
@@ -112,7 +109,7 @@ Repos are registered in `~/.config/compas/repos.json`.
 
 1. **Parse**: Tree-sitter extracts methods, classes, and call relationships from the AST
 2. **Chunk**: Each symbol becomes a chunk enriched with doc comments + source code
-3. **Embed**: Chunks are embedded via Ollama and stored in Qdrant
+3. **Embed**: Chunks are embedded via Ollama and stored in a repo-local Qdrant Edge shard
 4. **Graph**: Call relationships are persisted as JSON for fast lookup
 
 Indexing is incremental, unchanged files are skipped on reindex.

@@ -39,13 +39,12 @@ compas/
 │   ├── server.rs              # REST API (health, search, graph, summary)
 │   ├── store/
 │   │   ├── mod.rs             # Store trait
-│   │   └── qdrant.rs          # Qdrant vector store client
+│   │   ├── edge.rs            # Embedded Qdrant Edge store
 │   └── watcher.rs             # File watcher with debounced reindexing
 ├── scripts/
 │   ├── evaluate_compas.py     # Gold standard eval (13 queries, P@5 by difficulty)
 │   └── test_embedding_strategy.py  # Embedding strategy comparison
 ├── Cargo.toml
-├── docker-compose.yml          # Qdrant only
 └── README.md
 ```
 
@@ -80,7 +79,7 @@ cargo fmt
 ## Testing Workflow
 
 1. **Unit tests** go in `src/chunker/dart_test.rs` or inline `#[cfg(test)]` modules
-2. **Integration tests** are manual: build → index a repo → query via curl or MCP
+2. **Integration tests** are automated where possible and manual for real-repo smoke tests: build → index a repo → query via curl or MCP
 3. **Use any initialized repo** as a test target (e.g., a Flutter project)
 4. **Evaluation script** is `scripts/evaluate_compas.py` — 13 queries with gold-standard expected files, P@5 by difficulty
 
@@ -230,11 +229,11 @@ The MCP server auto-detects which repo to query from the current working directo
 - **Tree-sitter node kinds vary by grammar version.** The Dart grammar uses `class_declaration` not `class_definition`. Always verify with `cargo test debug_dart_ast -- --nocapture`.
 - **Dart `class_member` nodes wrap all method signatures.** The outer node is always `method_signature`; the real kind (factory constructor, getter, etc.) is inside. Use `unwrap_method_signature()`.
 - **MCP stdio server auto-detects repos from cwd.** No wrapper script needed — point `mcp.json` directly at the `compas` binary with `"args": ["mcp"]`.
-- **Qdrant collection must match embedding dims.** If you switch from `nomic-embed-text` (768d) to another model, delete and recreate the collection.
+- **Edge shard vector dims must match the embedding model.** If you switch from `nomic-embed-text` (768d) to another model, delete `.compas/edge-shard` and reindex.
 
 ## Search Ranking System
 
-Search quality is a combination of **semantic similarity** (Qdrant vector search) plus **post-search re-ranking** applied in both `src/mcp/tools.rs` and `src/server.rs`.
+Search quality is a combination of **semantic similarity** (Qdrant Edge vector search) plus **post-search re-ranking** applied in both `src/mcp/tools.rs` and `src/server.rs`.
 
 ### Current Boosts & Penalties
 

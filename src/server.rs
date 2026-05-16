@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::embedder::{EmbedMode, Embedder};
 use crate::graph::Graph;
+use crate::search::rerank_results;
 use crate::store::Store;
 use axum::{extract::Query, middleware, response::Json, routing::get, Router};
 use serde_json::json;
@@ -119,88 +120,7 @@ async fn search_handler(
     match repo.embedder.embed(&query, EmbedMode::Query).await {
         Ok(embedding) => match repo.store.search(&embedding, limit * 3, &filters).await {
             Ok(raw_results) => {
-                let query_lower = query.to_lowercase();
-                let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
-                let query_mentions_private = query_tokens.iter().any(|t| {
-                    *t == "private" || *t == "helper" || *t == "internal" || *t == "implementation"
-                });
-                let boosted: Vec<crate::models::SearchResult> = raw_results
-                    .into_iter()
-                    .map(|mut r| {
-                        let symbol_lower = r.chunk.symbol.to_lowercase();
-                        let file_lower = r.chunk.file_path.to_lowercase();
-                        let mut boost = 0.0f32;
-                        for token in &query_tokens {
-                            if symbol_lower.contains(token) {
-                                boost += 0.12;
-                            }
-                            if file_lower.contains(token) {
-                                boost += 0.10;
-                            }
-                        }
-                        match r.chunk.kind.as_str() {
-                            "class" => boost += 0.05,
-                            "method" => boost += 0.02,
-                            _ => {}
-                        }
-                        if let Some(node) = repo.graph.get(&r.chunk.symbol, &r.chunk.file_path) {
-                            let related: Vec<String> = node
-                                .calls
-                                .iter()
-                                .chain(node.called_by.iter())
-                                .map(|s| s.to_lowercase())
-                                .collect();
-                            for token in &query_tokens {
-                                if related.iter().any(|s| s.contains(token)) {
-                                    boost += 0.10;
-                                    break;
-                                }
-                            }
-                        }
-                        if r.chunk.symbol.starts_with('_') && !query_mentions_private {
-                            boost -= 0.15;
-                        }
-                        r.score += boost;
-                        r
-                    })
-                    .collect();
-
-                fn strip_part_suffix(name: &str) -> &str {
-                    name.rfind("_p")
-                        .and_then(|i| name[i + 2..].parse::<u32>().ok().map(|_| &name[..i]))
-                        .unwrap_or(name)
-                }
-                let mut best_by_symbol: std::collections::HashMap<
-                    (String, String),
-                    crate::models::SearchResult,
-                > = std::collections::HashMap::new();
-                for r in boosted {
-                    let stripped = strip_part_suffix(&r.chunk.symbol).to_string();
-                    let key = (r.chunk.file_path.clone(), stripped);
-                    let should_insert = match best_by_symbol.get(&key) {
-                        Some(existing) => r.score > existing.score,
-                        None => true,
-                    };
-                    if should_insert {
-                        best_by_symbol.insert(key, r);
-                    }
-                }
-
-                let mut file_counts: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                let mut results: Vec<crate::models::SearchResult> =
-                    best_by_symbol.into_values().collect();
-                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-                results.retain(|r| {
-                    let count = file_counts.entry(r.chunk.file_path.clone()).or_insert(0);
-                    if *count < 3 {
-                        *count += 1;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                results.truncate(limit);
+                let results = rerank_results(repo.graph.as_ref(), raw_results, &query, limit);
 
                 Json(json!({
                     "query": query,

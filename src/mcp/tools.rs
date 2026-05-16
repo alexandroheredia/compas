@@ -2,6 +2,7 @@ use super::state::{McpAppState, RepoState};
 use super::types::*;
 use crate::embedder::EmbedMode;
 use crate::models::SearchResult;
+use crate::search::rerank_results;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -107,7 +108,7 @@ async fn handle_search(
     }
 
     let results = match repo.store.search(&embedding, limit * 3, &filters).await {
-        Ok(raw_results) => rerank_results(repo, raw_results, query, limit),
+        Ok(raw_results) => rerank_results(repo.graph.as_ref(), raw_results, query, limit),
         Err(e) if is_edge_lock_error(&e.to_string()) => {
             search_via_daemon(query, limit, language, repo_name).await?
         }
@@ -123,104 +124,6 @@ async fn handle_search(
         }],
         is_error: None,
     })
-}
-
-fn rerank_results(
-    repo: &RepoState,
-    raw_results: Vec<SearchResult>,
-    query: &str,
-    limit: usize,
-) -> Vec<SearchResult> {
-    // Boost scores based on keyword matches in symbol name, file path, kind,
-    // graph relationships, and private-helper penalty.
-    let query_lower = query.to_lowercase();
-    let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
-    let query_mentions_private = query_tokens
-        .iter()
-        .any(|t| *t == "private" || *t == "helper" || *t == "internal" || *t == "implementation");
-    let boosted: Vec<SearchResult> = raw_results
-        .into_iter()
-        .map(|mut r| {
-            let symbol_lower = r.chunk.symbol.to_lowercase();
-            let file_lower = r.chunk.file_path.to_lowercase();
-            let mut boost = 0.0f32;
-            for token in &query_tokens {
-                if symbol_lower.contains(token) {
-                    boost += 0.12;
-                }
-                if file_lower.contains(token) {
-                    boost += 0.10;
-                }
-            }
-            match r.chunk.kind.as_str() {
-                "class" => boost += 0.05,
-                "method" => boost += 0.02,
-                _ => {}
-            }
-            // Graph cross-reference boost: if callers or callees contain query tokens,
-            // the symbol is likely part of the relevant subsystem even if its own text
-            // doesn't mention the query terms.
-            if let Some(node) = repo.graph.get(&r.chunk.symbol, &r.chunk.file_path) {
-                let related: Vec<String> = node
-                    .calls
-                    .iter()
-                    .chain(node.called_by.iter())
-                    .map(|s| s.to_lowercase())
-                    .collect();
-                for token in &query_tokens {
-                    if related.iter().any(|s| s.contains(token)) {
-                        boost += 0.10;
-                        break; // one boost per result regardless of how many relations match
-                    }
-                }
-            }
-            // Penalise private helpers unless the user is explicitly looking for them.
-            if r.chunk.symbol.starts_with('_') && !query_mentions_private {
-                boost -= 0.15;
-            }
-            r.score += boost;
-            r
-        })
-        .collect();
-
-    // Deduplicate by (file_path, stripped_symbol) so different symbols from the
-    // same file are preserved, but part-chunks (_p1, _p2) of the same symbol are collapsed.
-    // Cap at 3 symbols per file to preserve diversity across the codebase.
-    fn strip_part_suffix(name: &str) -> &str {
-        name.rfind("_p")
-            .and_then(|i| name[i + 2..].parse::<u32>().ok().map(|_| &name[..i]))
-            .unwrap_or(name)
-    }
-    let mut best_by_symbol: std::collections::HashMap<(String, String), SearchResult> =
-        std::collections::HashMap::new();
-    for r in boosted {
-        let stripped = strip_part_suffix(&r.chunk.symbol).to_string();
-        let key = (r.chunk.file_path.clone(), stripped);
-        let should_insert = match best_by_symbol.get(&key) {
-            Some(existing) => r.score > existing.score,
-            None => true,
-        };
-        if should_insert {
-            best_by_symbol.insert(key, r);
-        }
-    }
-
-    let mut file_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut results: Vec<SearchResult> = best_by_symbol.into_values().collect();
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-    results.retain(|r| {
-        let count = file_counts.entry(r.chunk.file_path.clone()).or_insert(0);
-        if *count < 3 {
-            *count += 1;
-            true
-        } else {
-            false
-        }
-    });
-    results.truncate(limit);
-
-    results
 }
 
 fn format_search_results(results: &[SearchResult]) -> String {

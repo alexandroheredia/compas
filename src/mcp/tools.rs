@@ -3,7 +3,6 @@ use super::types::*;
 use crate::embedder::EmbedMode;
 use crate::models::SearchResult;
 use crate::search::rerank_results;
-use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -94,7 +93,7 @@ async fn handle_search(
     let limit = args["limit"].as_u64().unwrap_or(10) as usize;
     let language = args["language"].as_str();
 
-    let (repo_name, repo) = resolve_repo(state, args)?;
+    let (_, repo) = resolve_repo(state, args)?;
 
     let embedding = repo
         .embedder
@@ -109,9 +108,6 @@ async fn handle_search(
 
     let results = match repo.store.search(&embedding, limit * 3, &filters).await {
         Ok(raw_results) => rerank_results(repo.graph.as_ref(), raw_results, query, limit),
-        Err(e) if is_edge_lock_error(&e.to_string()) => {
-            search_via_daemon(query, limit, language, repo_name).await?
-        }
         Err(e) => return Err(format!("search failed: {}", e)),
     };
 
@@ -157,62 +153,6 @@ fn format_search_results(results: &[SearchResult]) -> String {
         }
         lines.join("\n")
     }
-}
-
-async fn search_via_daemon(
-    query: &str,
-    limit: usize,
-    language: Option<&str>,
-    repo_name: &str,
-) -> Result<Vec<SearchResult>, String> {
-    #[derive(Deserialize)]
-    struct SearchResponse {
-        results: Vec<SearchResult>,
-    }
-
-    let host = std::env::var("COMPAS_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let port = std::env::var("COMPAS_PORT").unwrap_or_else(|_| "3001".into());
-    let url = format!("http://{}:{}/search", host, port);
-
-    let mut params: Vec<(&str, String)> = vec![
-        ("q", query.to_string()),
-        ("limit", limit.to_string()),
-        ("repo", repo_name.to_string()),
-    ];
-    if let Some(language) = language {
-        params.push(("language", language.to_string()));
-    }
-
-    let response = reqwest::Client::new()
-        .get(&url)
-        .query(&params)
-        .send()
-        .await
-        .map_err(|e| format!("daemon search request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "daemon search failed with HTTP {}",
-            response.status()
-        ));
-    }
-
-    let payload: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("failed to decode daemon search response: {}", e))?;
-
-    if let Some(error) = payload.get("error").and_then(|value| value.as_str()) {
-        return Err(format!("daemon search failed: {}", error));
-    }
-
-    serde_json::from_value::<SearchResponse>(payload)
-        .map(|response| response.results)
-        .map_err(|e| format!("failed to parse daemon search results: {}", e))
-}
-
-fn is_edge_lock_error(error: &str) -> bool {
-    error.contains("failed to open WAL") || error.contains("Resource temporarily unavailable")
 }
 
 async fn handle_graph(
@@ -271,9 +211,8 @@ mod tests {
     use crate::mcp::state::RepoState;
     use crate::models::Chunk;
     use crate::store::Store;
-    use anyhow::{anyhow, Result};
-    use axum::{routing::get, Json, Router};
-    use serde_json::{json, Value};
+    use anyhow::Result;
+    use serde_json::json;
     use std::sync::{Arc, Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -298,75 +237,38 @@ mod tests {
         }
     }
 
-    struct LockedStore;
-
-    #[async_trait::async_trait]
-    impl Store for LockedStore {
-        async fn init(&self, _vector_size: usize) -> Result<()> {
-            Ok(())
-        }
-
-        async fn upsert(&self, _chunks: &[Chunk], _embeddings: &[Vec<f32>]) -> Result<()> {
-            Err(anyhow!("not implemented"))
-        }
-
-        async fn search(
-            &self,
-            _embedding: &[f32],
-            _limit: usize,
-            _filters: &HashMap<String, String>,
-        ) -> Result<Vec<SearchResult>> {
-            Err(anyhow!(
-                "Service runtime error: failed to open WAL /tmp/test/wal: Resource temporarily unavailable"
-            ))
-        }
-
-        async fn delete_by_file(&self, _file_path: &str) -> Result<()> {
-            Err(anyhow!("not implemented"))
-        }
-    }
-
     #[tokio::test]
-    async fn search_codebase_falls_back_to_daemon_on_edge_lock() {
+    async fn search_codebase_reads_from_edge_store_without_daemon_fallback() {
         let _guard = env_lock().lock().unwrap();
 
-        async fn search_handler() -> Json<Value> {
-            Json(json!({
-                "query": "authentication",
-                "results": [{
-                    "chunk": {
-                        "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                        "content": "auth_service.dart AuthService.login\nFuture<void> login() async {}",
-                        "language": "dart",
-                        "file_path": "/tmp/lib/auth_service.dart",
-                        "symbol": "AuthService.login",
-                        "line_start": 1,
-                        "line_end": 2,
-                        "type": "method",
-                        "meta": {}
-                    },
-                    "score": 0.99
-                }]
-            }))
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port().to_string();
-        let server = tokio::spawn(async move {
-            let app = Router::new().route("/search", get(search_handler));
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let original_host = std::env::var_os("COMPAS_HOST");
-        let original_port = std::env::var_os("COMPAS_PORT");
-        std::env::set_var("COMPAS_HOST", "127.0.0.1");
-        std::env::set_var("COMPAS_PORT", &port);
+        let shard_path =
+            std::env::temp_dir().join(format!("compas-mcp-tools-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(crate::store::edge::EdgeStore::new(&shard_path, "default"));
+        store.init(4).await.unwrap();
+        store
+            .upsert(
+                &[Chunk {
+                    id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                    content: "auth_service.dart AuthService.login\nFuture<void> login() async {}"
+                        .to_string(),
+                    language: "dart".to_string(),
+                    file_path: "/tmp/lib/auth_service.dart".to_string(),
+                    symbol: "AuthService.login".to_string(),
+                    line_start: 1,
+                    line_end: 2,
+                    kind: "method".to_string(),
+                    meta: Default::default(),
+                }],
+                &[vec![1.0, 0.0, 0.0, 0.0]],
+            )
+            .await
+            .unwrap();
 
         let state = McpAppState {
             repos: HashMap::from([(
                 "bookswipe".to_string(),
                 RepoState {
-                    store: Arc::new(LockedStore),
+                    store,
                     graph: Arc::new(Graph::new()),
                     embedder: Arc::new(FakeEmbedder),
                 },
@@ -385,19 +287,9 @@ mod tests {
         let text = &result.content[0].text;
         assert!(
             text.contains("AuthService.login"),
-            "unexpected fallback text: {text}"
+            "unexpected search text: {text}"
         );
 
-        server.abort();
-        let _ = server.await;
-
-        match original_host {
-            Some(value) => std::env::set_var("COMPAS_HOST", value),
-            None => std::env::remove_var("COMPAS_HOST"),
-        }
-        match original_port {
-            Some(value) => std::env::set_var("COMPAS_PORT", value),
-            None => std::env::remove_var("COMPAS_PORT"),
-        }
+        std::fs::remove_dir_all(shard_path).unwrap();
     }
 }

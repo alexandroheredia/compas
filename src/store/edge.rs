@@ -1,6 +1,7 @@
 use super::Store;
 use crate::models::{Chunk, SearchResult};
 use anyhow::{anyhow, Context, Result};
+use fs4::FileExt;
 use qdrant_edge::{
     Condition, Distance, EdgeConfig, EdgeOptimizersConfig, EdgeShard, EdgeVectorParams,
     FieldCondition, Filter, JsonPath, Match, MatchValue, NamedQuery, Payload, PointId,
@@ -10,13 +11,14 @@ use qdrant_edge::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub struct EdgeStore {
     shard_path: PathBuf,
     vector_name: String,
-    shard: Arc<Mutex<Option<EdgeShard>>>,
+    operation_lock: Arc<Mutex<()>>,
 }
 
 impl EdgeStore {
@@ -24,7 +26,7 @@ impl EdgeStore {
         Self {
             shard_path: shard_path.into(),
             vector_name: vector_name.into(),
-            shard: Arc::new(Mutex::new(None)),
+            operation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -33,25 +35,127 @@ impl EdgeStore {
     }
 
     pub fn optimize(&self) -> Result<bool> {
-        let guard = self.load_or_get()?;
-        let shard = guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("edge shard unavailable after load"))?;
-        shard.optimize().map_err(edge_error)
+        self.with_locked_shard(None, |shard| shard.optimize().map_err(edge_error))
     }
 
-    fn load_or_get(&self) -> Result<std::sync::MutexGuard<'_, Option<EdgeShard>>> {
-        let mut guard = self
-            .shard
+    fn lock_path(&self) -> PathBuf {
+        let lock_name = self
+            .shard_path
+            .file_name()
+            .map(|name| format!("{}.lock", name.to_string_lossy()))
+            .unwrap_or_else(|| "edge-shard.lock".to_string());
+
+        self.shard_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(lock_name)
+    }
+
+    fn with_file_lock<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self
+            .operation_lock
             .lock()
             .map_err(|_| anyhow!("edge shard mutex poisoned"))?;
 
-        if guard.is_none() {
-            let shard = EdgeShard::load(&self.shard_path, None).map_err(edge_error)?;
-            *guard = Some(shard);
+        let lock_path = self.lock_path();
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create edge lock directory at {}",
+                    parent.display()
+                )
+            })?;
         }
 
-        Ok(guard)
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open edge lock file at {}", lock_path.display()))?;
+
+        lock_file.lock_exclusive().with_context(|| {
+            format!("failed to lock edge shard at {}", self.shard_path.display())
+        })?;
+
+        let result = f();
+        let unlock_result = lock_file.unlock().with_context(|| {
+            format!(
+                "failed to unlock edge shard at {}",
+                self.shard_path.display()
+            )
+        });
+
+        match (result, unlock_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn with_locked_shard<T>(
+        &self,
+        vector_size: Option<usize>,
+        f: impl FnOnce(&EdgeShard) -> Result<T>,
+    ) -> Result<T> {
+        self.with_file_lock(|| {
+            let shard = match vector_size {
+                Some(vector_size) => self.init_or_load_shard(vector_size)?,
+                None => self.load_existing_shard()?,
+            };
+            f(&shard)
+        })
+    }
+
+    fn init_or_load_shard(&self, vector_size: usize) -> Result<EdgeShard> {
+        std::fs::create_dir_all(&self.shard_path).with_context(|| {
+            format!(
+                "failed to create edge shard directory at {}",
+                self.shard_path.display()
+            )
+        })?;
+
+        let expected_config = self.edge_config(vector_size);
+        let has_existing_data = std::fs::read_dir(&self.shard_path)
+            .with_context(|| {
+                format!(
+                    "failed to inspect edge shard directory at {}",
+                    self.shard_path.display()
+                )
+            })?
+            .next()
+            .transpose()?
+            .is_some();
+
+        if has_existing_data {
+            EdgeShard::load(&self.shard_path, Some(expected_config))
+                .map_err(edge_error)
+                .with_context(|| {
+                    format!(
+                        "existing edge shard at {} is incompatible with vector '{}' and dimension {}. Delete {} and reindex if the embedding model or vector name changed",
+                        self.shard_path.display(),
+                        self.vector_name,
+                        vector_size,
+                        self.shard_path.display()
+                    )
+                })
+        } else {
+            EdgeShard::new(&self.shard_path, expected_config)
+                .map_err(edge_error)
+                .with_context(|| {
+                    format!(
+                        "failed to initialize edge shard at {}",
+                        self.shard_path.display()
+                    )
+                })
+        }
+    }
+
+    fn load_existing_shard(&self) -> Result<EdgeShard> {
+        EdgeShard::load(&self.shard_path, None)
+            .map_err(edge_error)
+            .with_context(|| format!("failed to load edge shard at {}", self.shard_path.display()))
     }
 
     fn edge_config(&self, vector_size: usize) -> EdgeConfig {
@@ -81,59 +185,7 @@ impl EdgeStore {
 #[async_trait::async_trait]
 impl Store for EdgeStore {
     async fn init(&self, vector_size: usize) -> Result<()> {
-        std::fs::create_dir_all(&self.shard_path).with_context(|| {
-            format!(
-                "failed to create edge shard directory at {}",
-                self.shard_path.display()
-            )
-        })?;
-
-        let expected_config = self.edge_config(vector_size);
-        let has_existing_data = std::fs::read_dir(&self.shard_path)
-            .with_context(|| {
-                format!(
-                    "failed to inspect edge shard directory at {}",
-                    self.shard_path.display()
-                )
-            })?
-            .next()
-            .transpose()?
-            .is_some();
-
-        let mut guard = self
-            .shard
-            .lock()
-            .map_err(|_| anyhow!("edge shard mutex poisoned"))?;
-
-        if guard.is_some() {
-            return Ok(());
-        }
-
-        let shard = if has_existing_data {
-            EdgeShard::load(&self.shard_path, Some(expected_config))
-                .map_err(edge_error)
-                .with_context(|| {
-                    format!(
-                        "existing edge shard at {} is incompatible with vector '{}' and dimension {}. Delete {} and reindex if the embedding model or vector name changed",
-                        self.shard_path.display(),
-                        self.vector_name,
-                        vector_size,
-                        self.shard_path.display()
-                    )
-                })?
-        } else {
-            EdgeShard::new(&self.shard_path, expected_config)
-                .map_err(edge_error)
-                .with_context(|| {
-                    format!(
-                        "failed to initialize edge shard at {}",
-                        self.shard_path.display()
-                    )
-                })?
-        };
-
-        *guard = Some(shard);
-        Ok(())
+        self.with_locked_shard(Some(vector_size), |_shard| Ok(()))
     }
 
     async fn upsert(&self, chunks: &[Chunk], embeddings: &[Vec<f32>]) -> Result<()> {
@@ -173,17 +225,14 @@ impl Store for EdgeStore {
             })
             .collect::<Result<_>>()?;
 
-        let guard = self.load_or_get()?;
-        let shard = guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("edge shard unavailable after load"))?;
-
-        shard
-            .update(UpdateOperation::PointOperation(
-                PointOperations::UpsertPoints(PointInsertOperations::PointsList(points)),
-            ))
-            .map_err(edge_error)
-            .context("failed to upsert points into edge shard")
+        self.with_locked_shard(None, |shard| {
+            shard
+                .update(UpdateOperation::PointOperation(
+                    PointOperations::UpsertPoints(PointInsertOperations::PointsList(points)),
+                ))
+                .map_err(edge_error)
+                .context("failed to upsert points into edge shard")
+        })
     }
 
     async fn search(
@@ -194,41 +243,33 @@ impl Store for EdgeStore {
     ) -> Result<Vec<SearchResult>> {
         let filter = build_filter(filters)?;
 
-        let guard = self.load_or_get()?;
-        let shard = guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("edge shard unavailable after load"))?;
+        self.with_locked_shard(Some(embedding.len()), |shard| {
+            let results = shard
+                .query(QueryRequest {
+                    prefetches: vec![],
+                    query: Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::new(
+                        VectorInternal::Dense(embedding.to_vec()),
+                        self.vector_name.clone(),
+                    )))),
+                    filter,
+                    score_threshold: None,
+                    limit,
+                    offset: 0,
+                    params: None,
+                    with_vector: WithVector::Bool(false),
+                    with_payload: WithPayloadInterface::Bool(true),
+                })
+                .map_err(edge_error)
+                .context("failed to search edge shard")?;
 
-        let results = shard
-            .query(QueryRequest {
-                prefetches: vec![],
-                query: Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::new(
-                    VectorInternal::Dense(embedding.to_vec()),
-                    self.vector_name.clone(),
-                )))),
-                filter,
-                score_threshold: None,
-                limit,
-                offset: 0,
-                params: None,
-                with_vector: WithVector::Bool(false),
-                with_payload: WithPayloadInterface::Bool(true),
-            })
-            .map_err(edge_error)
-            .context("failed to search edge shard")?;
-
-        results
-            .into_iter()
-            .map(search_result_from_scored_point)
-            .collect()
+            results
+                .into_iter()
+                .map(search_result_from_scored_point)
+                .collect()
+        })
     }
 
     async fn delete_by_file(&self, file_path: &str) -> Result<()> {
-        let guard = self.load_or_get()?;
-        let shard = guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("edge shard unavailable after load"))?;
-
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
             parse_json_path("file_path")?,
             Match::Value(MatchValue {
@@ -236,12 +277,14 @@ impl Store for EdgeStore {
             }),
         )));
 
-        shard
-            .update(UpdateOperation::PointOperation(
-                PointOperations::DeletePointsByFilter(filter),
-            ))
-            .map_err(edge_error)
-            .with_context(|| format!("failed to delete points for file '{}'", file_path))
+        self.with_locked_shard(None, |shard| {
+            shard
+                .update(UpdateOperation::PointOperation(
+                    PointOperations::DeletePointsByFilter(filter),
+                ))
+                .map_err(edge_error)
+                .with_context(|| format!("failed to delete points for file '{}'", file_path))
+        })
     }
 }
 
@@ -579,6 +622,55 @@ mod tests {
         }
 
         drop(store);
+        fs::remove_dir_all(shard_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edge_store_supports_multiple_instances_on_same_shard() {
+        let shard_path = temp_shard_path("multi-instance");
+        let writer = Arc::new(EdgeStore::new(&shard_path, "default"));
+        writer.init(4).await.unwrap();
+
+        let chunks = vec![sample_chunk(
+            "66666666-6666-6666-6666-666666666666",
+            "/tmp/lib/auth.dart",
+            "AuthService.login",
+            "dart",
+        )];
+        let embeddings = vec![vec![1.0, 0.0, 0.0, 0.0]];
+        writer.upsert(&chunks, &embeddings).await.unwrap();
+
+        let reader = Arc::new(EdgeStore::new(&shard_path, "default"));
+
+        let writer_task = {
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move {
+                writer
+                    .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+                    .await
+                    .unwrap()
+            })
+        };
+        let reader_task = {
+            let reader = Arc::clone(&reader);
+            tokio::spawn(async move {
+                reader
+                    .search(&[1.0, 0.0, 0.0, 0.0], 5, &HashMap::new())
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let writer_results = writer_task.await.unwrap();
+        let reader_results = reader_task.await.unwrap();
+
+        assert_eq!(writer_results.len(), 1);
+        assert_eq!(reader_results.len(), 1);
+        assert_eq!(writer_results[0].chunk.symbol, "AuthService.login");
+        assert_eq!(reader_results[0].chunk.symbol, "AuthService.login");
+
+        drop(writer);
+        drop(reader);
         fs::remove_dir_all(shard_path).unwrap();
     }
 }

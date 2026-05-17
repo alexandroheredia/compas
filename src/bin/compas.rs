@@ -1288,7 +1288,8 @@ async fn run_mcp() -> anyhow::Result<()> {
             repo_path.join(&config.store.path),
             &config.store.vector_name,
         ));
-        edge_store.init(embedder.dimensions()).await?;
+        // MCP startup only loads repo descriptors. The shard is opened on demand
+        // when a tool call actually targets this repo.
         let store: Arc<dyn compas::store::Store> = edge_store;
         let graph = Arc::new(Graph::new());
         let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
@@ -1365,7 +1366,8 @@ async fn serve() -> anyhow::Result<()> {
             repo_path.join(&config.store.path),
             &config.store.vector_name,
         ));
-        edge_store.init(embedder.dimensions()).await?;
+        // Daemon startup only loads repo descriptors. The shard is opened on
+        // demand when a request actually targets this repo.
         let store: Arc<dyn compas::store::Store> = edge_store;
         let graph = Arc::new(Graph::new());
         let embedder: Arc<dyn compas::embedder::Embedder> = embedder;

@@ -462,6 +462,30 @@ mod tests {
         fs::remove_dir_all(shard_path).unwrap();
     }
 
+    #[test]
+    fn edge_store_new_does_not_create_shard_or_lock_files() {
+        let shard_path = temp_shard_path("constructor-only");
+        let lock_path = shard_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(
+                "{}.lock",
+                shard_path.file_name().unwrap().to_string_lossy()
+            ));
+
+        let store = EdgeStore::new(&shard_path, "default");
+
+        assert_eq!(store.shard_path(), shard_path.as_path());
+        assert!(
+            !shard_path.exists(),
+            "constructor should not create shard path"
+        );
+        assert!(
+            !lock_path.exists(),
+            "constructor should not create lock file"
+        );
+    }
+
     #[tokio::test]
     async fn edge_store_search_respects_filters() {
         let shard_path = temp_shard_path("filters");

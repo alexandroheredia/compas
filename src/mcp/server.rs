@@ -68,7 +68,10 @@ async fn send_response(stdout: &mut tokio::io::Stdout, resp: &JsonRpcResponse) {
     debug!("mcp send: {}", json);
 }
 
-async fn handle_request(state: &Arc<McpAppState>, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+pub(crate) async fn handle_request(
+    state: &Arc<McpAppState>,
+    req: JsonRpcRequest,
+) -> Option<JsonRpcResponse> {
     let id = req.id.clone();
 
     match req.method.as_str() {
@@ -165,5 +168,134 @@ async fn handle_tools_call(
             })),
             error: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedder::{EmbedMode, Embedder};
+    use crate::graph::Graph;
+    use crate::mcp::state::RepoState;
+    use crate::models::Chunk;
+    use crate::store::edge::EdgeStore;
+    use crate::store::Store;
+    use anyhow::Result;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct FakeEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FakeEmbedder {
+        async fn embed(&self, text: &str, _mode: EmbedMode) -> Result<Vec<f32>> {
+            Ok(test_embedding(text))
+        }
+
+        async fn embed_batch(&self, texts: &[String], _mode: EmbedMode) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|text| test_embedding(text)).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    fn test_embedding(text: &str) -> Vec<f32> {
+        let lower = text.to_lowercase();
+        if lower.contains("auth") || lower.contains("login") {
+            vec![1.0, 0.0, 0.0, 0.0]
+        } else {
+            vec![0.0, 1.0, 0.0, 0.0]
+        }
+    }
+
+    fn temp_shard_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("compas-mcp-test-{name}-{nanos}"))
+    }
+
+    fn sample_chunk() -> Chunk {
+        Chunk {
+            id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            content: "auth_service.dart AuthService.login\nFuture<String> login() async {}"
+                .to_string(),
+            language: "dart".to_string(),
+            file_path: "/tmp/lib/auth_service.dart".to_string(),
+            symbol: "AuthService.login".to_string(),
+            line_start: 1,
+            line_end: 3,
+            kind: "method".to_string(),
+            meta: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_call_search_codebase_returns_edge_results() {
+        let shard_path = temp_shard_path("search-codebase");
+        let store_impl = Arc::new(EdgeStore::new(&shard_path, "default"));
+        store_impl.init(4).await.unwrap();
+
+        let chunk = sample_chunk();
+        store_impl
+            .upsert(&[chunk], &[vec![1.0, 0.0, 0.0, 0.0]])
+            .await
+            .unwrap();
+
+        let graph = Arc::new(Graph::new());
+        graph.add_symbol("AuthService.login", "/tmp/lib/auth_service.dart", "method");
+
+        let state = Arc::new(McpAppState {
+            repos: HashMap::from([(
+                "test-repo".to_string(),
+                RepoState {
+                    store: store_impl.clone() as Arc<dyn Store>,
+                    graph,
+                    embedder: Arc::new(FakeEmbedder),
+                },
+            )]),
+            default_repo: Some("test-repo".to_string()),
+        });
+
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "search_codebase",
+                "arguments": {
+                    "query": "authentication",
+                    "limit": 5
+                }
+            }),
+        };
+
+        let response = handle_request(&state, request).await.unwrap();
+        assert!(
+            response.error.is_none(),
+            "unexpected error: {:?}",
+            response.error
+        );
+
+        let result = response.result.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("AuthService.login"),
+            "unexpected MCP text: {text}"
+        );
+        assert!(
+            text.contains("auth_service.dart"),
+            "unexpected MCP text: {text}"
+        );
+
+        drop(state);
+        drop(store_impl);
+        std::fs::remove_dir_all(shard_path).unwrap();
     }
 }

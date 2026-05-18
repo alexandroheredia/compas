@@ -2,7 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+## compas 2026.5.9
+
+`compas init` now generates a `.compasignore` file alongside `compas.yaml`, pre-filled
+with sensible defaults for the detected language (Flutter, TypeScript, Rust, Python, Go).
+It works like `.gitignore`: one glob pattern per line, `#` for comments, trailing `/`
+matches the whole directory tree. Files matching any pattern are skipped during indexing
+and cleaned out of Qdrant and the symbol graph on the next reindex.
+
+The missing-docs audit no longer flags standard Flutter lifecycle methods (`build`,
+`createState`, `initState`, `dispose`, and friends) as missing documentation. They are
+framework boilerplate, not real findings.
+
+The missing-docs audit now covers the entire codebase. Previously, files that were
+unchanged since the last index were silently skipped during the audit pass.
 
 ## compas 2026.5.8
 

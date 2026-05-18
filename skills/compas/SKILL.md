@@ -143,11 +143,13 @@ Open the most relevant file confirmed by both tools.
 ## If Search Returns Nothing
 
 1. Rephrase with synonyms:
-  - `"AI"` → `"Claude"` or `"OpenAI"`
-  - `"metadata"` → `"product details"` or `"book info"`
-  - `"cache"` → `"storage"` or `"offline"`
+   - `"AI"` → `"Claude"` or `"OpenAI"`
+   - `"metadata"` → `"product details"` or `"book info"`
+   - `"cache"` → `"storage"` or `"offline"`
 2. Try a broader query with a higher limit
-3. Fall back to `grep` ONLY after compas fails — log the miss
+3. Fall back to text search tools ONLY after compas fails — log the miss
+
+If MCP search fails with `failed to open WAL` or `Resource temporarily unavailable`, make sure `compas serve` is running. MCP can fall back to the daemon for search, but only if the daemon is available.
 
 ---
 

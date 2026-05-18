@@ -1,22 +1,139 @@
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use compas::{
-    chunker::{dart::extract_calls, ChunkerRegistry},
+    chunker::{
+        dart::{extract_calls, extract_semantic_references},
+        ChunkerRegistry,
+    },
     config::AppConfig,
     embedder::{ollama::OllamaEmbedder, EmbedMode, Embedder},
     graph::Graph,
     mcp::{self, state::McpAppState},
     server::{router, AppState, RepoState},
-    store::{qdrant::QdrantStore, Store},
+    store::{edge::EdgeStore, Store},
     watcher::{FileWatcher, Handler},
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
+
+const FLUTTER_LIFECYCLE_METHODS: &[&str] = &[
+    "build",
+    "createState",
+    "initState",
+    "dispose",
+    "didChangeDependencies",
+    "didUpdateWidget",
+    "didChangeAppLifecycleState",
+    "deactivate",
+    "activate",
+    "reassemble",
+    "setState",
+    "mount",
+    "unmount",
+];
+
+const FLUTTER_CALLBACK_SUFFIXES: &[&str] = &[
+    "onPressed",
+    "onTap",
+    "onChanged",
+    "onSaved",
+    "onSubmitted",
+    "onEditingComplete",
+];
+
+/// Members that are dispatched by frameworks/runtime, not by direct call sites.
+/// These should never be flagged as dead code because the absence of a reference
+/// in source is meaningless — Flutter, Dart, json_serializable, etc. call them.
+const FRAMEWORK_DISPATCHED_MEMBERS: &[&str] = &[
+    // Flutter widget lifecycle
+    "build",
+    "createState",
+    "initState",
+    "dispose",
+    "didChangeDependencies",
+    "didUpdateWidget",
+    "didChangeAppLifecycleState",
+    "deactivate",
+    "activate",
+    "reassemble",
+    "mount",
+    "unmount",
+    // InheritedWidget / InheritedNotifier
+    "updateShouldNotify",
+    "updateShouldNotifyDependent",
+    // ChangeNotifier / Listenable
+    "notifyListeners",
+    "addListener",
+    "removeListener",
+    // Dart object protocol
+    "toString",
+    "toJson",
+    "fromJson",
+    "fromMap",
+    "toMap",
+    "fromSnapshot",
+    "fromDoc",
+    "fromDocument",
+    "noSuchMethod",
+    "hashCode",
+    // App entrypoint
+    "main",
+    // Flutter render/paint hooks
+    "paint",
+    "shouldRepaint",
+    "shouldRebuildSemantics",
+    "performLayout",
+    "performResize",
+    // Stream/Future protocol
+    "call",
+];
+
+fn is_framework_dispatched(member_name: &str) -> bool {
+    if FRAMEWORK_DISPATCHED_MEMBERS.contains(&member_name) {
+        return true;
+    }
+    // operator overloads (==, +, -, [], etc.) are dispatched by the runtime
+    if member_name.starts_with("operator ") {
+        return true;
+    }
+    false
+}
+
+#[derive(Debug, Clone)]
+struct AuditDeclaration {
+    file: String,
+    display_file: String,
+    symbol: String,
+    kind: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuditReference {
+    #[allow(dead_code)]
+    caller_file: String,
+    callee: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AuditFileAnalysis {
+    declarations: Vec<AuditDeclaration>,
+    references: Vec<AuditReference>,
+    file_edges: Vec<(String, String)>,
+    key_types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeadCodeCandidate {
+    file: String,
+    symbol: String,
+    kind: String,
+}
 
 #[derive(Parser)]
 #[command(name = "compas")]
@@ -35,9 +152,11 @@ enum Commands {
     Init,
     /// Index the repository
     Index,
-    /// Start the REST server
+    /// Optimize the local edge shard
+    Optimize,
+    /// Start the HTTP daemon for REST, eval scripts, and multi-repo access
     Serve,
-    /// Start the MCP stdio server for agent integration
+    /// Start the MCP stdio tool server for editors and AI agents
     Mcp,
     /// Watch files and auto-reindex
     Watch,
@@ -56,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
             let config = AppConfig::load(cli.config.to_str().unwrap())?;
             match cmd {
                 Commands::Index => index_repo(config).await,
+                Commands::Optimize => optimize_repo(config).await,
                 Commands::Watch => watch(config).await,
                 Commands::Init | Commands::Serve | Commands::Mcp => unreachable!(),
             }
@@ -155,8 +275,6 @@ fn init_repo() -> anyhow::Result<()> {
         ),
     };
 
-    let collection = repo_name.to_lowercase().replace(' ', "_").to_string();
-
     let yaml = format!(
         r#"repo:
   path: .
@@ -171,9 +289,9 @@ embedder:
   url: http://localhost:11434
 
 store:
-  provider: qdrant
-  url: http://localhost:6333
-  collection: {}
+  provider: edge
+  path: .compas/edge-shard
+  vector_name: default
 
 server:
   host: 127.0.0.1
@@ -193,7 +311,6 @@ index:
             .map(|s| format!("    - \"{}\"", s))
             .collect::<Vec<_>>()
             .join("\n"),
-        collection,
     );
 
     std::fs::write(&config_path, yaml)?;
@@ -270,10 +387,9 @@ Only skip if you already know the **exact file path and line number**.
     println!("Created compas.yaml in {:?}", cwd);
     println!("Detected language: {}", dominant.unwrap_or("unknown"));
     println!("\nNext steps:");
-    println!("  1. Start Qdrant:  docker-compose up -d");
-    println!("  2. Start Ollama:  ollama serve");
-    println!("  3. Index repo:    compas index");
-    println!("  4. Start server:  compas serve");
+    println!("  1. Start Ollama:  ollama serve");
+    println!("  2. Index repo:    compas index");
+    println!("  3. Start server:  compas serve");
     println!("\nTo make 'compas' available everywhere, copy the binary to your PATH:");
     println!("  cp /path/to/compas/target/release/compas /usr/local/bin/");
 
@@ -290,22 +406,7 @@ fn hash_bytes(bytes: &[u8]) -> String {
 
 fn is_flutter_boilerplate(symbol: &str) -> bool {
     let method_name = symbol.rsplit('.').next().unwrap_or(symbol);
-    [
-        "build",
-        "createState",
-        "initState",
-        "dispose",
-        "didChangeDependencies",
-        "didUpdateWidget",
-        "didChangeAppLifecycleState",
-        "deactivate",
-        "activate",
-        "reassemble",
-        "setState",
-        "mount",
-        "unmount",
-    ]
-    .contains(&method_name)
+    FLUTTER_LIFECYCLE_METHODS.contains(&method_name)
 }
 
 struct CompasIgnore {
@@ -350,6 +451,324 @@ impl CompasIgnore {
     }
 }
 
+fn relative_display_path(repo_path: &Path, file: &Path) -> String {
+    file.strip_prefix(repo_path)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn audit_path_filename(file_path: &str) -> String {
+    Path::new(file_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.to_string())
+}
+
+fn normalize_relative_uri(base_file: &Path, uri: &str) -> String {
+    base_file
+        .parent()
+        .unwrap_or(base_file)
+        .join(uri)
+        .components()
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .to_string()
+}
+
+fn package_name(repo_path: &Path) -> Option<String> {
+    let pubspec_path = repo_path.join("pubspec.yaml");
+    let content = std::fs::read_to_string(pubspec_path).ok()?;
+    content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("name:")
+            .map(|name| name.trim().trim_matches('"').trim_matches('\'').to_string())
+            .filter(|name| !name.is_empty())
+    })
+}
+
+fn normalize_import_uri(
+    repo_path: &Path,
+    base_file: &Path,
+    uri: &str,
+    package_name: Option<&str>,
+) -> Option<String> {
+    if uri.starts_with("dart:") {
+        return None;
+    }
+    if let Some(rest) = uri.strip_prefix("package:") {
+        let (package, relative) = rest.split_once('/')?;
+        if Some(package) != package_name {
+            return None;
+        }
+        return Some(
+            repo_path
+                .join("lib")
+                .join(relative)
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+    Some(
+        repo_path
+            .join(normalize_relative_uri(base_file, uri))
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+fn build_audit_analysis(
+    repo_path: &Path,
+    manifest: &std::collections::HashMap<String, String>,
+) -> AuditFileAnalysis {
+    let mut analysis = AuditFileAnalysis::default();
+    let mut seen_decls = HashSet::new();
+    let repo_package_name = package_name(repo_path);
+
+    for path_str in manifest.keys() {
+        let file_path = Path::new(path_str);
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let display_file = relative_display_path(repo_path, file_path);
+
+        let chunker = compas::chunker::dart::DartChunker;
+        let chunks = match compas::chunker::Chunker::chunk(&chunker, path_str, &content) {
+            Ok(chunks) => chunks,
+            Err(_) => continue,
+        };
+
+        for chunk in chunks {
+            let symbol = strip_part_suffix(&chunk.symbol);
+            let is_filename_placeholder =
+                chunk.kind == "declaration" && symbol == audit_path_filename(path_str);
+            if chunk.kind == "file" || symbol.contains("unknown") || is_filename_placeholder {
+                continue;
+            }
+            if seen_decls.insert(format!("{}:{}:{}", path_str, symbol, chunk.kind)) {
+                analysis.declarations.push(AuditDeclaration {
+                    file: path_str.clone(),
+                    display_file: display_file.clone(),
+                    symbol,
+                    kind: chunk.kind,
+                });
+            }
+        }
+
+        if let Ok(semantic) = extract_semantic_references(&content) {
+            analysis
+                .references
+                .extend(
+                    semantic
+                        .references
+                        .into_iter()
+                        .map(|(_, callee)| AuditReference {
+                            caller_file: path_str.clone(),
+                            callee,
+                        }),
+                );
+            analysis.key_types.extend(semantic.key_types);
+            analysis
+                .file_edges
+                .extend(semantic.import_uris.into_iter().filter_map(|uri| {
+                    normalize_import_uri(repo_path, file_path, &uri, repo_package_name.as_deref())
+                        .map(|target| (path_str.clone(), target))
+                }));
+        }
+    }
+
+    analysis.key_types.sort();
+    analysis.key_types.dedup();
+    analysis.file_edges.sort();
+    analysis.file_edges.dedup();
+    analysis
+}
+
+#[allow(dead_code)]
+fn reachable_files(
+    manifest: &std::collections::HashMap<String, String>,
+    analysis: &AuditFileAnalysis,
+) -> HashSet<String> {
+    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
+    for path in manifest.keys() {
+        adjacency.entry(path.clone()).or_default();
+    }
+    for reference in &analysis.references {
+        if let Some(target) = resolve_reference_file(&reference.callee, &analysis.declarations) {
+            adjacency
+                .entry(reference.caller_file.clone())
+                .or_default()
+                .push(target);
+        }
+    }
+    for (source, target) in &analysis.file_edges {
+        adjacency
+            .entry(source.clone())
+            .or_default()
+            .push(target.clone());
+        adjacency.entry(target.clone()).or_default();
+    }
+
+    let mut inbound_counts: HashMap<String, usize> = HashMap::new();
+    for (source, targets) in &adjacency {
+        inbound_counts.entry(source.clone()).or_insert(0);
+        for target in targets {
+            *inbound_counts.entry(target.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut queue = VecDeque::new();
+    let mut reachable = HashSet::new();
+    for path in manifest.keys() {
+        if inbound_counts.get(path).copied().unwrap_or(0) == 0 {
+            queue.push_back(path.clone());
+        }
+    }
+
+    while let Some(path) = queue.pop_front() {
+        if !reachable.insert(path.clone()) {
+            continue;
+        }
+        if let Some(targets) = adjacency.get(&path) {
+            for target in targets {
+                if manifest.contains_key(target) {
+                    queue.push_back(target.clone());
+                }
+            }
+        }
+    }
+
+    reachable
+}
+
+#[allow(dead_code)]
+fn resolve_reference_file(callee: &str, declarations: &[AuditDeclaration]) -> Option<String> {
+    declarations
+        .iter()
+        .find(|decl| decl.symbol == callee || decl.symbol.rsplit('.').next() == Some(callee))
+        .map(|decl| decl.file.clone())
+}
+
+fn classify_dead_code_candidates(analysis: &AuditFileAnalysis) -> Vec<DeadCodeCandidate> {
+    // Build a global bare-name set of every callee referenced anywhere.
+    // If a name appears in any reference, every declaration with that bare name
+    // is considered live. This is intentionally permissive: false negatives
+    // (missing a real dead method that shares a name with a live one) are far
+    // less costly than the false positives we get from precise matching when
+    // Dart's dynamic dispatch hides receiver types.
+    let mut referenced_names: HashSet<String> = HashSet::new();
+    for reference in &analysis.references {
+        // Record both the full callee and its last segment.
+        referenced_names.insert(reference.callee.clone());
+        if let Some(bare) = reference.callee.rsplit('.').next() {
+            referenced_names.insert(bare.to_string());
+        }
+    }
+
+    let key_types: HashSet<String> = analysis.key_types.iter().cloned().collect();
+    let mut candidates = vec![];
+
+    for declaration in &analysis.declarations {
+        // Skip declaration-level wrappers and types — we only care about callable members.
+        if matches!(
+            declaration.kind.as_str(),
+            "class" | "mixin" | "extension" | "enum" | "file" | "typedef"
+        ) {
+            continue;
+        }
+
+        // Skip filename-placeholder declarations from the chunker.
+        if declaration.kind == "declaration"
+            && declaration.symbol == audit_path_filename(&declaration.file)
+        {
+            continue;
+        }
+        if declaration.symbol.contains("unknown") {
+            continue;
+        }
+
+        let member_name = declaration
+            .symbol
+            .rsplit('.')
+            .next()
+            .unwrap_or(&declaration.symbol);
+        let enclosing_type = declaration
+            .symbol
+            .split('.')
+            .next()
+            .unwrap_or(&declaration.symbol);
+
+        // Hard suppressions: framework dispatch.
+        if is_framework_dispatched(member_name) {
+            continue;
+        }
+
+        // operator == / hashCode are framework-dispatched anyway, but as a belt-and-braces
+        // also suppress them whenever the enclosing class is used as a Map/Set key.
+        if (member_name == "operator ==" || member_name == "hashCode")
+            && key_types.contains(enclosing_type)
+        {
+            continue;
+        }
+
+        // Skip private members entirely. They are by definition internal to the file
+        // and the audit produces too much noise on `_buildRow`-style helpers.
+        if member_name.starts_with('_') {
+            continue;
+        }
+
+        // Skip getters and setters. They are read via property syntax that we cannot
+        // reliably distinguish from random identifier reads, so the signal is weak.
+        if declaration.kind == "getter_setter" {
+            continue;
+        }
+
+        // Skip constructors named like codegen entrypoints (fromJson, fromMap, etc.).
+        // These are matched above in is_framework_dispatched, but the constructor symbol
+        // is `Class.fromJson` so check the member_name explicitly too.
+        if matches!(declaration.kind.as_str(), "constructor")
+            && matches!(
+                member_name,
+                "fromJson" | "fromMap" | "fromSnapshot" | "fromDoc" | "fromDocument" | "fromString"
+            )
+        {
+            continue;
+        }
+
+        // Skip the unnamed default constructor (symbol like `Class.Class`) when the class
+        // itself is referenced anywhere by name. A class being instantiated (`Foo()`)
+        // shows up in references as the bare name `Foo`.
+        if declaration.kind == "constructor"
+            && member_name == enclosing_type
+            && referenced_names.contains(enclosing_type)
+        {
+            continue;
+        }
+
+        // Skip Flutter callback-style members (onPressed, onTap, etc.) — these are passed
+        // as widget parameters and dispatched by the framework.
+        if FLUTTER_CALLBACK_SUFFIXES.contains(&member_name) {
+            continue;
+        }
+
+        // Final liveness check: is the bare name referenced anywhere?
+        if referenced_names.contains(member_name) {
+            continue;
+        }
+
+        candidates.push(DeadCodeCandidate {
+            file: declaration.display_file.clone(),
+            symbol: declaration.symbol.clone(),
+            kind: declaration.kind.clone(),
+        });
+    }
+
+    candidates.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.cmp(&b.symbol)));
+    candidates
+}
+
 async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     let embedder = Arc::new(OllamaEmbedder::new(
         &config.embedder.url,
@@ -357,9 +776,10 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         config.embedder.query_prefix.clone().unwrap_or_default(),
         config.embedder.doc_prefix.clone().unwrap_or_default(),
     ));
-    let store = Arc::new(QdrantStore::new(
-        &config.store.url,
-        &config.store.collection,
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let store = Arc::new(EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
     ));
     store.init(embedder.dimensions()).await?;
 
@@ -367,8 +787,6 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     let chunker = registry
         .get("dart")
         .ok_or_else(|| anyhow::anyhow!("no dart chunker"))?;
-
-    let repo_path = std::fs::canonicalize(&config.repo.path)?;
 
     // Load .compasignore patterns
     let compas_ignore = CompasIgnore::load(&repo_path);
@@ -725,8 +1143,12 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         .ok();
     graph.save(&graph_path)?;
 
+    let audit_analysis = build_audit_analysis(&repo_path, &new_manifest);
+    let dead_code_candidates = classify_dead_code_candidates(&audit_analysis);
+
     generate_audit(
         &graph,
+        &dead_code_candidates,
         &chunks_without_docs,
         processed,
         total_chunks,
@@ -752,18 +1174,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
 
-    let dead_code_count = graph
-        .all_nodes()
-        .iter()
-        .filter(|(_, n)| {
-            !n.file.is_empty()
-                && n.kind != "class"
-                && n.kind != "mixin"
-                && n.kind != "extension"
-                && n.calls.is_empty()
-                && n.called_by.is_empty()
-        })
-        .count();
+    let dead_code_count = dead_code_candidates.len();
 
     println!();
     println!("     @@@@@@@   @@@@@@   @@@@@@@@@@   @@@@@@@    @@@@@@    @@@@@@   ");
@@ -802,7 +1213,41 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     if !use_tui {
         info!("indexing complete");
     }
+
+    println!("Optimizing edge shard...");
+    let optimized = store.optimize()?;
+    if optimized {
+        println!("✓ Edge shard optimized");
+    } else {
+        println!("✓ Edge shard already optimized");
+    }
+
     Ok(())
+}
+
+async fn optimize_repo(config: AppConfig) -> anyhow::Result<()> {
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let optimized = optimize_edge_shard(&config)?;
+
+    if optimized {
+        println!("Optimized edge shard for {}", repo_path.display());
+    } else {
+        println!(
+            "Edge shard for {} did not require optimization",
+            repo_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn optimize_edge_shard(config: &AppConfig) -> anyhow::Result<bool> {
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let store = EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
+    );
+    store.optimize()
 }
 
 async fn run_mcp() -> anyhow::Result<()> {
@@ -832,19 +1277,22 @@ async fn run_mcp() -> anyhow::Result<()> {
             }
         };
 
-        let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-            &config.store.url,
-            &config.store.collection,
-        ));
-        let graph = Arc::new(Graph::new());
-        let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
+        let repo_path = std::fs::canonicalize(path)?;
+        let embedder = Arc::new(OllamaEmbedder::new(
             &config.embedder.url,
             &config.embedder.model,
             config.embedder.query_prefix.clone().unwrap_or_default(),
             config.embedder.doc_prefix.clone().unwrap_or_default(),
         ));
-
-        let repo_path = std::fs::canonicalize(path)?;
+        let edge_store = Arc::new(EdgeStore::new(
+            repo_path.join(&config.store.path),
+            &config.store.vector_name,
+        ));
+        // MCP startup only loads repo descriptors. The shard is opened on demand
+        // when a tool call actually targets this repo.
+        let store: Arc<dyn compas::store::Store> = edge_store;
+        let graph = Arc::new(Graph::new());
+        let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
         let graph_path = repo_path.join(".compas").join("graph.json");
         if let Err(e) = graph.load(&graph_path) {
             warn!("no existing graph loaded for repo '{}': {}", name, e);
@@ -907,19 +1355,22 @@ async fn serve() -> anyhow::Result<()> {
             }
         };
 
-        let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-            &config.store.url,
-            &config.store.collection,
-        ));
-        let graph = Arc::new(Graph::new());
-        let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
+        let repo_path = std::fs::canonicalize(path)?;
+        let embedder = Arc::new(OllamaEmbedder::new(
             &config.embedder.url,
             &config.embedder.model,
             config.embedder.query_prefix.clone().unwrap_or_default(),
             config.embedder.doc_prefix.clone().unwrap_or_default(),
         ));
-
-        let repo_path = std::fs::canonicalize(path)?;
+        let edge_store = Arc::new(EdgeStore::new(
+            repo_path.join(&config.store.path),
+            &config.store.vector_name,
+        ));
+        // Daemon startup only loads repo descriptors. The shard is opened on
+        // demand when a request actually targets this repo.
+        let store: Arc<dyn compas::store::Store> = edge_store;
+        let graph = Arc::new(Graph::new());
+        let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
         let graph_path = repo_path.join(".compas").join("graph.json");
         if let Err(e) = graph.load(&graph_path) {
             warn!("no existing graph loaded for repo '{}': {}", name, e);
@@ -989,16 +1440,19 @@ async fn serve() -> anyhow::Result<()> {
 
 async fn watch(config: AppConfig) -> anyhow::Result<()> {
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
-    let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-        &config.store.url,
-        &config.store.collection,
-    ));
-    let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
+    let embedder = Arc::new(OllamaEmbedder::new(
         &config.embedder.url,
         &config.embedder.model,
         config.embedder.query_prefix.clone().unwrap_or_default(),
         config.embedder.doc_prefix.clone().unwrap_or_default(),
     ));
+    let edge_store = Arc::new(EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
+    ));
+    edge_store.init(embedder.dimensions()).await?;
+    let store: Arc<dyn compas::store::Store> = edge_store;
+    let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
     let handler = ReindexHandler {
         config,
         store,
@@ -1155,73 +1609,13 @@ impl Handler for ReindexHandler {
 }
 
 fn generate_audit(
-    graph: &Graph,
+    _graph: &Graph,
+    dead_code: &[DeadCodeCandidate],
     missing_docs: &[(String, String, String, usize)],
     files: usize,
     chunks: usize,
     failed: usize,
 ) {
-    let nodes = graph.all_nodes();
-
-    // Classify dead code candidates
-    let flutter_lifecycle = [
-        "build",
-        "createState",
-        "initState",
-        "dispose",
-        "didChangeDependencies",
-        "didUpdateWidget",
-        "didChangeAppLifecycleState",
-        "deactivate",
-        "activate",
-        "reassemble",
-        "setState",
-        "mount",
-        "unmount",
-    ];
-    let flutter_callback_suffixes = [
-        "onPressed",
-        "onTap",
-        "onChanged",
-        "onSaved",
-        "onSubmitted",
-        "onEditingComplete",
-    ];
-
-    let mut dead_code: Vec<(String, String, String)> = vec![]; // (file, symbol, likely_false_positive)
-    for (_key, node) in nodes.iter() {
-        if node.file.is_empty()
-            || node.kind == "class"
-            || node.kind == "mixin"
-            || node.kind == "extension"
-        {
-            continue;
-        }
-        if !node.calls.is_empty() || !node.called_by.is_empty() {
-            continue;
-        }
-        let method_name = node.name.rsplit('.').next().unwrap_or(&node.name);
-        let is_lifecycle = flutter_lifecycle.contains(&method_name);
-        let is_callback = flutter_callback_suffixes
-            .iter()
-            .any(|s| method_name.ends_with(s) || method_name == s.trim_start_matches("on"));
-        let is_private_test = method_name.starts_with('_') && node.kind == "method";
-        let reason = if is_lifecycle {
-            "Flutter lifecycle".to_string()
-        } else if is_callback {
-            "Likely callback".to_string()
-        } else if is_private_test {
-            "Private, likely callback".to_string()
-        } else {
-            "Review carefully".to_string()
-        };
-        let rel = std::path::Path::new(&node.file)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| node.file.clone());
-        dead_code.push((rel, node.name.clone(), reason));
-    }
-
     // Deduplicate missing docs by base symbol (strip _pN suffix from split chunks).
     // A large function split into _p1, _p2, _p3 should only appear once in the audit.
     let mut seen_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1234,7 +1628,6 @@ fn generate_audit(
     }
     let mut missing_docs = deduped_docs;
     missing_docs.sort_by(|a, b| a.0.cmp(&b.0));
-    dead_code.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut md = String::new();
     md.push_str("# Compas Codebase Audit\n\n");
@@ -1327,16 +1720,22 @@ fn generate_audit(
     // Dead code section
     md.push_str("## Potentially Dead Code\n\n");
     md.push_str(
-        "These symbols have no inbound or outbound calls. Many are likely false positives\n",
+        "These declarations have no inbound semantic references after framework dispatch,\n",
     );
-    md.push_str("(Flutter callbacks, lifecycle methods, getters accessed as properties). Review before removing.\n\n");
+    md.push_str(
+        "Dart protocol, getter, and codegen suppressions. Each entry is worth a human review;\n",
+    );
+    md.push_str("private helpers, lifecycle methods, and serialization hooks are excluded.\n\n");
     if dead_code.is_empty() {
         md.push_str("*No dead code candidates found!* 🎉\n");
     } else {
-        md.push_str("| File | Symbol | Assessment |\n");
-        md.push_str("|------|--------|-------------|\n");
-        for (file, symbol, reason) in &dead_code {
-            md.push_str(&format!("| {} | {} | {} |\n", file, symbol, reason));
+        md.push_str("| File | Symbol | Kind |\n");
+        md.push_str("|------|--------|------|\n");
+        for candidate in dead_code {
+            md.push_str(&format!(
+                "| {} | {} | {} |\n",
+                candidate.file, candidate.symbol, candidate.kind
+            ));
         }
     }
 
@@ -1393,4 +1792,473 @@ fn should_include(path: &std::path::Path, include: &[String], exclude: &[String]
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::post, Json, Router};
+    use serde_json::{json, Value};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("compas-cli-test-{name}-{nanos}"))
+    }
+
+    fn embedding_for(text: &str) -> Vec<f32> {
+        let lower = text.to_lowercase();
+        let mut embedding = vec![0.0; 768];
+        if lower.contains("auth") || lower.contains("authentication") || lower.contains("login") {
+            embedding[0] = 1.0;
+        } else if lower.contains("cache") {
+            embedding[1] = 1.0;
+        } else {
+            embedding[2] = 1.0;
+        }
+        embedding
+    }
+
+    async fn start_mock_ollama() -> (String, tokio::task::JoinHandle<()>) {
+        async fn embed_handler(Json(payload): Json<Value>) -> Json<Value> {
+            let inputs = payload["input"].as_array().cloned().unwrap_or_default();
+            let embeddings: Vec<Vec<f32>> = inputs
+                .iter()
+                .map(|value| embedding_for(value.as_str().unwrap_or_default()))
+                .collect();
+            Json(json!({ "embeddings": embeddings }))
+        }
+
+        let app = Router::new().route("/api/embed", post(embed_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn wait_for_server(port: &str) {
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/health");
+        for _ in 0..50 {
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("server did not become ready on port {port}");
+    }
+
+    fn decl(file: &str, symbol: &str, kind: &str) -> AuditDeclaration {
+        AuditDeclaration {
+            file: file.into(),
+            display_file: file.into(),
+            symbol: symbol.into(),
+            kind: kind.into(),
+        }
+    }
+
+    fn reference(caller_file: &str, callee: &str) -> AuditReference {
+        AuditReference {
+            caller_file: caller_file.into(),
+            callee: callee.into(),
+        }
+    }
+
+    #[test]
+    fn test_bare_name_match_credits_all_same_named_declarations() {
+        // If `loadUsers` is called anywhere, every declaration named `loadUsers`
+        // is considered live — even if the call is on a variable whose type we
+        // cannot resolve (the common Dart case with Riverpod providers).
+        let analysis = AuditFileAnalysis {
+            declarations: vec![
+                decl(
+                    "lib/management/service_user_management.dart",
+                    "UserManagementService.loadUsers",
+                    "method",
+                ),
+                decl(
+                    "lib/admin/service_admin.dart",
+                    "AdminService.loadUsers",
+                    "method",
+                ),
+            ],
+            references: vec![reference(
+                "lib/management/provider_user_management.dart",
+                "loadUsers",
+            )],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert!(
+            candidates.is_empty(),
+            "Expected bare-name match to credit all `loadUsers` declarations, got: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_methods_are_hard_suppressed() {
+        let analysis = AuditFileAnalysis {
+            declarations: vec![
+                decl("lib/screen.dart", "MyScreen.createState", "method"),
+                decl("lib/screen.dart", "_MyScreenState.initState", "method"),
+                decl("lib/screen.dart", "_MyScreenState.build", "method"),
+                decl(
+                    "lib/widget.dart",
+                    "MyInherited.updateShouldNotify",
+                    "method",
+                ),
+            ],
+            references: vec![],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert!(
+            candidates.is_empty(),
+            "Expected lifecycle methods to be suppressed, got: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_main_function_is_suppressed() {
+        let analysis = AuditFileAnalysis {
+            declarations: vec![decl("lib/main.dart", "main", "function")],
+            references: vec![],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert!(
+            candidates.is_empty(),
+            "Expected `main` to be suppressed, got: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_protocol_methods_are_suppressed() {
+        let analysis = AuditFileAnalysis {
+            declarations: vec![
+                decl("lib/model.dart", "User.fromJson", "constructor"),
+                decl("lib/model.dart", "User.toJson", "method"),
+                decl("lib/model.dart", "User.toString", "method"),
+                decl("lib/model.dart", "User.hashCode", "getter_setter"),
+                decl("lib/model.dart", "User.operator ==", "method"),
+            ],
+            references: vec![],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert!(
+            candidates.is_empty(),
+            "Expected protocol/codegen methods to be suppressed, got: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_private_members_are_suppressed() {
+        let analysis = AuditFileAnalysis {
+            declarations: vec![
+                decl("lib/widget.dart", "MyWidget._buildRow", "method"),
+                decl("lib/util.dart", "_internalHelper", "function"),
+            ],
+            references: vec![],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert!(
+            candidates.is_empty(),
+            "Expected private members to be suppressed, got: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_default_constructor_skipped_when_class_referenced() {
+        // `HolidayService()` shows up in references as just `HolidayService`,
+        // and the default constructor is keyed as `HolidayService.HolidayService`.
+        let analysis = AuditFileAnalysis {
+            declarations: vec![decl(
+                "lib/service.dart",
+                "HolidayService.HolidayService",
+                "constructor",
+            )],
+            references: vec![reference("lib/provider.dart", "HolidayService")],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert!(
+            candidates.is_empty(),
+            "Expected default constructor to be alive when class is referenced, got: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_truly_unreferenced_method_is_flagged() {
+        let analysis = AuditFileAnalysis {
+            declarations: vec![decl("lib/abandoned.dart", "AbandonedService.run", "method")],
+            references: vec![reference("lib/other.dart", "somethingElse")],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "Expected exactly one candidate, got: {candidates:?}"
+        );
+        assert_eq!(candidates[0].symbol, "AbandonedService.run");
+    }
+
+    #[test]
+    fn test_filename_placeholder_declarations_are_skipped() {
+        let analysis = AuditFileAnalysis {
+            declarations: vec![AuditDeclaration {
+                file: "lib/core/providers/provider_auth.dart".into(),
+                display_file: "lib/core/providers/provider_auth.dart".into(),
+                symbol: "provider_auth.dart".into(),
+                kind: "declaration".into(),
+            }],
+            references: vec![],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert!(
+            candidates.is_empty(),
+            "Expected no candidates, got: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_getter_setter_kind_is_skipped() {
+        let analysis = AuditFileAnalysis {
+            declarations: vec![decl("lib/svc.dart", "Service.someGetter", "getter_setter")],
+            references: vec![],
+            file_edges: vec![],
+            key_types: vec![],
+        };
+
+        let candidates = classify_dead_code_candidates(&analysis);
+        assert!(
+            candidates.is_empty(),
+            "Expected getter_setter to be suppressed, got: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_import_uri_returns_manifest_style_absolute_paths() {
+        let repo_path = Path::new("/repo");
+        let base_file = Path::new("/repo/lib/main.dart");
+
+        assert_eq!(
+            normalize_import_uri(
+                repo_path,
+                base_file,
+                "package:tyoajanseuranta/core/providers/provider_auth.dart",
+                Some("tyoajanseuranta"),
+            ),
+            Some("/repo/lib/core/providers/provider_auth.dart".to_string())
+        );
+        assert_eq!(
+            normalize_import_uri(repo_path, base_file, "auth/screen_login.dart", None),
+            Some("/repo/lib/auth/screen_login.dart".to_string())
+        );
+    }
+
+    #[test]
+    fn test_reachable_files_follow_package_local_imports() {
+        // Reachability is no longer used by dead-code classification, but the
+        // helper is kept around for potential future "orphan files" reporting.
+        let analysis = AuditFileAnalysis {
+            declarations: vec![],
+            references: vec![],
+            file_edges: vec![(
+                "/repo/lib/main.dart".into(),
+                "/repo/lib/core/providers/provider_auth.dart".into(),
+            )],
+            key_types: vec![],
+        };
+
+        let manifest = HashMap::from([
+            ("/repo/lib/main.dart".to_string(), "hash1".to_string()),
+            (
+                "/repo/lib/core/providers/provider_auth.dart".to_string(),
+                "hash2".to_string(),
+            ),
+        ]);
+        let reachable = reachable_files(&manifest, &analysis);
+
+        assert!(reachable.contains("/repo/lib/main.dart"));
+        assert!(reachable.contains("/repo/lib/core/providers/provider_auth.dart"));
+    }
+
+    #[tokio::test]
+    async fn test_init_index_and_search_over_http() {
+        let _guard = test_lock().lock().unwrap();
+
+        let repo_dir = unique_temp_path("repo");
+        let home_dir = unique_temp_path("home");
+        std::fs::create_dir_all(repo_dir.join("lib")).unwrap();
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::write(
+            repo_dir.join("lib").join("auth_service.dart"),
+            r#"class AuthService {
+  Future<String> login(String email, String password) async {
+    return email;
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_port = std::env::var_os("COMPAS_PORT");
+
+        let (mock_url, mock_handle) = start_mock_ollama().await;
+        let port = ((SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            % 1000)
+            + 31000)
+            .to_string();
+
+        std::env::set_current_dir(&repo_dir).unwrap();
+        std::env::set_var("HOME", &home_dir);
+        std::env::set_var("COMPAS_PORT", &port);
+
+        init_repo().unwrap();
+
+        let config_path = repo_dir.join("compas.yaml");
+        let config_text = std::fs::read_to_string(&config_path).unwrap();
+        let updated = config_text.replace("http://localhost:11434", &mock_url);
+        std::fs::write(&config_path, updated).unwrap();
+
+        let config = AppConfig::load(config_path.to_str().unwrap()).unwrap();
+        index_repo(config).await.unwrap();
+
+        let serve_handle = tokio::spawn(async { serve().await.unwrap() });
+        wait_for_server(&port).await;
+
+        let response: Value =
+            reqwest::get(format!("http://127.0.0.1:{port}/search?q=authentication"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+
+        let results = response["results"].as_array().unwrap();
+        assert!(
+            !results.is_empty(),
+            "expected search results, got {response}"
+        );
+        let symbols: Vec<&str> = results
+            .iter()
+            .filter_map(|result| result["chunk"]["symbol"].as_str())
+            .collect();
+        assert!(
+            symbols.contains(&"AuthService") || symbols.contains(&"AuthService.login"),
+            "expected auth symbols in results, got {symbols:?}"
+        );
+
+        serve_handle.abort();
+        let _ = serve_handle.await;
+        mock_handle.abort();
+        let _ = mock_handle.await;
+
+        std::env::set_current_dir(original_dir).unwrap();
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_port {
+            Some(value) => std::env::set_var("COMPAS_PORT", value),
+            None => std::env::remove_var("COMPAS_PORT"),
+        }
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+        std::fs::remove_dir_all(&home_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_optimize_edge_shard_succeeds_for_initialized_repo() {
+        let repo_dir = unique_temp_path("optimize");
+        std::fs::create_dir_all(repo_dir.join(".compas")).unwrap();
+
+        let config = AppConfig {
+            repo: compas::config::RepoConfig {
+                path: repo_dir.to_string_lossy().to_string(),
+                include: vec!["lib/**/*.dart".into()],
+                exclude: vec![],
+            },
+            embedder: compas::config::EmbedderConfig {
+                provider: "ollama".into(),
+                model: "nomic-embed-text".into(),
+                url: "http://localhost:11434".into(),
+                query_prefix: None,
+                doc_prefix: None,
+            },
+            store: compas::config::StoreConfig {
+                provider: "edge".into(),
+                path: ".compas/edge-shard".into(),
+                vector_name: "default".into(),
+            },
+            server: compas::config::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: "3001".into(),
+            },
+            index: compas::config::IndexConfig {
+                chunk_by: "function".into(),
+                watch: true,
+            },
+        };
+
+        let store = EdgeStore::new(repo_dir.join(&config.store.path), &config.store.vector_name);
+        store.init(4).await.unwrap();
+        drop(store);
+
+        let _ = optimize_edge_shard(&config).unwrap();
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+    }
+
+    #[test]
+    fn test_watch_include_patterns_match_nested_dart_files() {
+        assert!(should_include(
+            Path::new("lib/services/auth_service.dart"),
+            &["lib/**/*.dart".into()],
+            &[]
+        ));
+        assert!(!should_include(
+            Path::new("build/generated/auth_service.g.dart"),
+            &["lib/**/*.dart".into()],
+            &["**/*.g.dart".into(), "build/**".into()]
+        ));
+    }
 }

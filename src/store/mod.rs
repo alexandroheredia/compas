@@ -15,4 +15,4 @@ pub trait Store: Send + Sync {
     async fn delete_by_file(&self, file_path: &str) -> Result<()>;
 }
 
-pub mod qdrant;
+pub mod edge;

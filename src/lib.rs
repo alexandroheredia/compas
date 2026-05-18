@@ -5,6 +5,7 @@ pub mod graph;
 pub mod mcp;
 pub mod middleware;
 pub mod models;
+pub mod search;
 pub mod server;
 pub mod store;
 pub mod util;

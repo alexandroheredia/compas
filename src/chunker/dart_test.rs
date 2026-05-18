@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use crate::chunker::dart::{extract_calls, extract_doc_comments, DartChunker};
+    use crate::chunker::dart::{
+        extract_calls, extract_doc_comments, extract_semantic_references, DartChunker,
+    };
     use crate::chunker::Chunker;
     use tree_sitter::{Node, Parser};
 
@@ -252,6 +254,135 @@ void topLevel() {
     }
 
     #[test]
+    fn test_semantic_references_capture_getter_reads() {
+        let code = r#"class Product {
+  String get displayName => name;
+
+  String render() {
+    return displayName;
+  }
+}
+"#;
+
+        let analysis = extract_semantic_references(code).unwrap();
+        assert!(
+            analysis
+                .references
+                .contains(&("Product.render".to_string(), "displayName".to_string(),)),
+            "Expected getter read to be recorded, got: {:?}",
+            analysis.references
+        );
+    }
+
+    #[test]
+    fn test_operator_name_preserved_in_chunks() {
+        let code = r#"class Product {
+  @override
+  bool operator ==(Object other) => identical(this, other);
+}
+"#;
+
+        let chunker = DartChunker;
+        let chunks = chunker.chunk("lib/product.dart", code).unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.symbol == "Product.operator =="),
+            "Expected operator symbol, got: {:?}",
+            chunks.iter().map(|c| c.symbol.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            chunks.iter().all(|chunk| !chunk.symbol.contains("unknown")),
+            "Unexpected unknown symbol in {:?}",
+            chunks.iter().map(|c| c.symbol.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_semantic_references_traverse_nested_closures() {
+        let code = r#"class Product {
+  void helper() {}
+
+  void render() {
+    items.map((item) {
+      helper();
+      return item;
+    }).toList();
+  }
+}
+"#;
+
+        let analysis = extract_semantic_references(code).unwrap();
+        assert!(
+            analysis
+                .references
+                .contains(&("Product.render".to_string(), "helper".to_string())),
+            "Expected nested closure reference, got: {:?}",
+            analysis.references
+        );
+    }
+
+    #[test]
+    fn test_semantic_references_detect_key_types() {
+        let code = r#"class ProductKey {}
+
+Map<ProductKey, String> names = {};
+Set<ProductKey> seen = {};
+"#;
+
+        let analysis = extract_semantic_references(code).unwrap();
+        assert_eq!(analysis.key_types, vec!["ProductKey".to_string()]);
+    }
+
+    #[test]
+    fn test_semantic_references_detect_family_key_types() {
+        let code = r#"
+class TravelApprovalsInvoicesRequest {}
+
+final provider = StreamProvider.autoDispose.family<List<String>, TravelApprovalsInvoicesRequest>(
+  (ref, request) => const Stream.empty(),
+);
+"#;
+
+        let analysis = extract_semantic_references(code).unwrap();
+        assert_eq!(
+            analysis.key_types,
+            vec!["TravelApprovalsInvoicesRequest".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_file_fallback_chunk_is_file_kind() {
+        let code = r#"part of widgets;"#;
+        let chunker = DartChunker;
+        let chunks = chunker.chunk("lib/part_only.dart", code).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, "file");
+        assert_eq!(chunks[0].symbol, "part_only.dart");
+    }
+
+    #[test]
+    fn test_semantic_references_capture_relative_imports() {
+        let code = r#"
+import 'src/helpers.dart';
+import 'package:tyoajanseuranta/core/providers/provider_auth.dart';
+export '../shared/models.dart';
+part 'generated.g.dart';
+"#;
+
+        let analysis = extract_semantic_references(code).unwrap();
+        assert_eq!(
+            analysis.import_uris,
+            vec![
+                "../shared/models.dart".to_string(),
+                "generated.g.dart".to_string(),
+                "package:tyoajanseuranta/core/providers/provider_auth.dart".to_string(),
+                "src/helpers.dart".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn test_chunk_includes_doc_comment() {
         let code = r#"import 'dart:io';
 
@@ -275,5 +406,50 @@ class CacheService {
         assert!(method_chunk
             .content
             .contains("cache_service.dart CacheService.saveAll"));
+    }
+
+    #[test]
+    fn test_semantic_references_capture_calls_in_provider_arrow_body() {
+        // Regression: top-level `final fooProvider = Provider((ref) { ... })`
+        // is parsed by tree-sitter-dart as `static_final_declaration_list` (with
+        // the `final` keyword as a separate sibling token), not as
+        // `final_declaration`. The walker must descend into the function-
+        // expression body of the initializer so calls like `service.loadUsers(...)`
+        // inside Riverpod provider arrow functions are recorded as references.
+        let code = r#"
+final userManagementBootstrapProvider =
+    FutureProvider<Object>((ref) async {
+  final service = ref.watch(userManagementServiceProvider);
+  final results = await Future.wait<Object>([
+    service.loadUsers(orgId),
+    service.loadDepartments(orgId),
+    service.loadPendingInvitations(orgId),
+    service.loadContractedHoursOptions(orgId),
+  ]);
+  return results;
+});
+"#;
+
+        let analysis = extract_semantic_references(code).unwrap();
+        let callees: Vec<&String> = analysis
+            .references
+            .iter()
+            .filter(|(caller, _)| caller == "userManagementBootstrapProvider")
+            .map(|(_, callee)| callee)
+            .collect();
+
+        for expected in &[
+            "loadUsers",
+            "loadDepartments",
+            "loadPendingInvitations",
+            "loadContractedHoursOptions",
+        ] {
+            assert!(
+                callees.iter().any(|c| c.as_str() == *expected),
+                "expected callee {} from arrow body, got {:?}",
+                expected,
+                callees
+            );
+        }
     }
 }

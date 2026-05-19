@@ -136,9 +136,8 @@ mod tests {
                 exclude: vec![],
             },
             embedder: EmbedderConfig {
-                provider: "ollama".to_string(),
-                model: "nomic-embed-text".to_string(),
-                url: "http://localhost:11434".to_string(),
+                provider: "fastembed".to_string(),
+                model: "nomic-ai/nomic-embed-text-v1.5".to_string(),
                 query_prefix: None,
                 doc_prefix: None,
             },

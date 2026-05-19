@@ -6,7 +6,7 @@ use compas::{
         ChunkerRegistry,
     },
     config::AppConfig,
-    embedder::{ollama::OllamaEmbedder, EmbedMode, Embedder},
+    embedder::{build_embedder, EmbedMode},
     graph::Graph,
     mcp::{self, state::McpAppState},
     server::{router, AppState, RepoState},
@@ -284,9 +284,8 @@ fn init_repo() -> anyhow::Result<()> {
 {}
 
 embedder:
-  provider: ollama
-  model: nomic-embed-text
-  url: http://localhost:11434
+  provider: fastembed
+  model: nomic-ai/nomic-embed-text-v1.5
 
 store:
   provider: edge
@@ -387,9 +386,9 @@ Only skip if you already know the **exact file path and line number**.
     println!("Created compas.yaml in {:?}", cwd);
     println!("Detected language: {}", dominant.unwrap_or("unknown"));
     println!("\nNext steps:");
-    println!("  1. Start Ollama:  ollama serve");
-    println!("  2. Index repo:    compas index");
-    println!("  3. Start server:  compas serve");
+    println!("  1. Index repo:    compas index");
+    println!("  2. Start server:  compas serve");
+    println!("\nThe embedding model downloads automatically on first index.");
     println!("\nTo make 'compas' available everywhere, copy the binary to your PATH:");
     println!("  cp /path/to/compas/target/release/compas /usr/local/bin/");
 
@@ -770,12 +769,7 @@ fn classify_dead_code_candidates(analysis: &AuditFileAnalysis) -> Vec<DeadCodeCa
 }
 
 async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
-    let embedder = Arc::new(OllamaEmbedder::new(
-        &config.embedder.url,
-        &config.embedder.model,
-        config.embedder.query_prefix.clone().unwrap_or_default(),
-        config.embedder.doc_prefix.clone().unwrap_or_default(),
-    ));
+    let embedder = build_embedder(&config.embedder)?;
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
     let store = Arc::new(EdgeStore::new(
         repo_path.join(&config.store.path),
@@ -1278,12 +1272,7 @@ async fn run_mcp() -> anyhow::Result<()> {
         };
 
         let repo_path = std::fs::canonicalize(path)?;
-        let embedder = Arc::new(OllamaEmbedder::new(
-            &config.embedder.url,
-            &config.embedder.model,
-            config.embedder.query_prefix.clone().unwrap_or_default(),
-            config.embedder.doc_prefix.clone().unwrap_or_default(),
-        ));
+        let embedder = build_embedder(&config.embedder)?;
         let edge_store = Arc::new(EdgeStore::new(
             repo_path.join(&config.store.path),
             &config.store.vector_name,
@@ -1356,12 +1345,7 @@ async fn serve() -> anyhow::Result<()> {
         };
 
         let repo_path = std::fs::canonicalize(path)?;
-        let embedder = Arc::new(OllamaEmbedder::new(
-            &config.embedder.url,
-            &config.embedder.model,
-            config.embedder.query_prefix.clone().unwrap_or_default(),
-            config.embedder.doc_prefix.clone().unwrap_or_default(),
-        ));
+        let embedder = build_embedder(&config.embedder)?;
         let edge_store = Arc::new(EdgeStore::new(
             repo_path.join(&config.store.path),
             &config.store.vector_name,
@@ -1440,12 +1424,7 @@ async fn serve() -> anyhow::Result<()> {
 
 async fn watch(config: AppConfig) -> anyhow::Result<()> {
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
-    let embedder = Arc::new(OllamaEmbedder::new(
-        &config.embedder.url,
-        &config.embedder.model,
-        config.embedder.query_prefix.clone().unwrap_or_default(),
-        config.embedder.doc_prefix.clone().unwrap_or_default(),
-    ));
+    let embedder = build_embedder(&config.embedder)?;
     let edge_store = Arc::new(EdgeStore::new(
         repo_path.join(&config.store.path),
         &config.store.vector_name,
@@ -1797,8 +1776,7 @@ fn should_include(path: &std::path::Path, include: &[String], exclude: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::post, Json, Router};
-    use serde_json::{json, Value};
+    use serde_json::Value;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1813,38 +1791,6 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("compas-cli-test-{name}-{nanos}"))
-    }
-
-    fn embedding_for(text: &str) -> Vec<f32> {
-        let lower = text.to_lowercase();
-        let mut embedding = vec![0.0; 768];
-        if lower.contains("auth") || lower.contains("authentication") || lower.contains("login") {
-            embedding[0] = 1.0;
-        } else if lower.contains("cache") {
-            embedding[1] = 1.0;
-        } else {
-            embedding[2] = 1.0;
-        }
-        embedding
-    }
-
-    async fn start_mock_ollama() -> (String, tokio::task::JoinHandle<()>) {
-        async fn embed_handler(Json(payload): Json<Value>) -> Json<Value> {
-            let inputs = payload["input"].as_array().cloned().unwrap_or_default();
-            let embeddings: Vec<Vec<f32>> = inputs
-                .iter()
-                .map(|value| embedding_for(value.as_str().unwrap_or_default()))
-                .collect();
-            Json(json!({ "embeddings": embeddings }))
-        }
-
-        let app = Router::new().route("/api/embed", post(embed_handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{}", addr), handle)
     }
 
     async fn wait_for_server(port: &str) {
@@ -2139,7 +2085,6 @@ mod tests {
         let original_home = std::env::var_os("HOME");
         let original_port = std::env::var_os("COMPAS_PORT");
 
-        let (mock_url, mock_handle) = start_mock_ollama().await;
         let port = ((SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2156,7 +2101,9 @@ mod tests {
 
         let config_path = repo_dir.join("compas.yaml");
         let config_text = std::fs::read_to_string(&config_path).unwrap();
-        let updated = config_text.replace("http://localhost:11434", &mock_url);
+        let updated = config_text
+            .replace("provider: fastembed", "provider: test")
+            .replace("model: nomic-ai/nomic-embed-text-v1.5", "model: test");
         std::fs::write(&config_path, updated).unwrap();
 
         let config = AppConfig::load(config_path.to_str().unwrap()).unwrap();
@@ -2189,8 +2136,6 @@ mod tests {
 
         serve_handle.abort();
         let _ = serve_handle.await;
-        mock_handle.abort();
-        let _ = mock_handle.await;
 
         std::env::set_current_dir(original_dir).unwrap();
         match original_home {
@@ -2218,9 +2163,8 @@ mod tests {
                 exclude: vec![],
             },
             embedder: compas::config::EmbedderConfig {
-                provider: "ollama".into(),
-                model: "nomic-embed-text".into(),
-                url: "http://localhost:11434".into(),
+                provider: "fastembed".into(),
+                model: "nomic-ai/nomic-embed-text-v1.5".into(),
                 query_prefix: None,
                 doc_prefix: None,
             },

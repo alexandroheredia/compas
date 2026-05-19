@@ -30,8 +30,8 @@ compas/
 │   │   └── dart_test.rs       # Unit tests for AST parsing
 │   ├── config.rs              # compas.yaml deserialization
 │   ├── embedder/
-│   │   ├── mod.rs             # Embedder trait
-│   │   └── ollama.rs          # Ollama embedder implementation
+│   │   ├── mod.rs             # Embedder trait + factory
+│   │   └── fastembed.rs       # FastEmbed embedder implementation
 │   ├── graph.rs               # Symbol graph (nodes + edges, JSON persistence)
 │   ├── middleware.rs           # Axum request logging middleware
 │   ├── models.rs              # Chunk, SearchResult, SymbolNode structs
@@ -234,7 +234,7 @@ The MCP server auto-detects which repo to query from the current working directo
 - **Tree-sitter node kinds vary by grammar version.** The Dart grammar uses `class_declaration` not `class_definition`. Always verify with `cargo test debug_dart_ast -- --nocapture`.
 - **Dart `class_member` nodes wrap all method signatures.** The outer node is always `method_signature`; the real kind (factory constructor, getter, etc.) is inside. Use `unwrap_method_signature()`.
 - **MCP stdio server auto-detects repos from cwd.** No wrapper script needed — point `mcp.json` directly at the `compas` binary with `"args": ["mcp"]`.
-- **Edge shard vector dims must match the embedding model.** If you switch from `nomic-embed-text` (768d) to another model, delete `.compas/edge-shard` and reindex.
+- **Edge shard vector dims must match the embedding model.** If you switch from `nomic-ai/nomic-embed-text-v1.5` (FastEmbed) to another model, delete `.compas/edge-shard` and reindex. Dimensions are determined at runtime on first embed.
 
 ## Search Ranking System
 
@@ -265,7 +265,7 @@ Applied to raw Qdrant results before deduplication:
 
 ## Known Limitations
 
-1. **Semantic vocabulary gaps.** The embedding model (`nomic-embed-text`) does not bridge certain synonym pairs:
+1. **Semantic vocabulary gaps.** The embedding model (`nomic-ai/nomic-embed-text-v1.5` via FastEmbed) does not bridge certain synonym pairs:
    - "metadata" ↔ "product info" (`ProductService.getInfoById` is invisible to "metadata" queries)
    - "AI" ↔ "Claude" (`AIService` is invisible to "AI" queries)
      These are fundamental to the model, not fixable with query-time heuristics.

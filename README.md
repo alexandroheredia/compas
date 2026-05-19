@@ -6,7 +6,7 @@
 
 **compas** is a local semantic search engine for your codebase. It indexes your code using embeddings + AST analysis, then answers natural language queries like "where is authentication handled?" with ranked, relevant code snippets, complete with file paths, line numbers, and call relationships.
 
-It runs entirely on your machine (Ollama + embedded Qdrant Edge) and exposes its capabilities via MCP so AI agents (Copilot, Claude, Cursor) can search your code without burning tokens on irrelevant files.
+It runs entirely on your machine (FastEmbed + embedded Qdrant Edge) and exposes its capabilities via MCP so AI agents (Copilot, Claude, Cursor) can search your code without burning tokens on irrelevant files.
 
 > **For AI agents setting this up:** Read [`docs/SETUP.md`](docs/SETUP.md) - exact, copy-pasteable commands.
 
@@ -21,28 +21,25 @@ Both are exposed as MCP tools that agents call directly.
 
 ## Quick Start
 
-**Prerequisites:** Rust 1.75+, Ollama
+**Prerequisites:** Rust 1.75+
 
 ```bash
-# 1. Pull embedding model
-ollama pull nomic-embed-text
-
-# 2. Build
+# 1. Build
 git clone https://github.com/alexandroheredia/compas.git
 cd compas
 cargo build --release
 
-# 3. Initialize a project
+# 2. Initialize a project
 cd your-project
 /path/to/compas/target/release/compas init
 
-# 4. Index
+# 3. Index (first run downloads the embedding model)
 /path/to/compas/target/release/compas index
 
-# 5. Start daemon
+# 4. Start daemon
 /path/to/compas/target/release/compas serve
 
-# 6. Query
+# 5. Query
 curl "http://localhost:3001/search?q=how+does+caching+work"
 ```
 
@@ -118,7 +115,7 @@ This is separate from MCP: your editor can launch `compas mcp` for tool calls wh
 
 1. **Parse**: Tree-sitter extracts methods, classes, and call relationships from the AST
 2. **Chunk**: Each symbol becomes a chunk enriched with doc comments + source code
-3. **Embed**: Chunks are embedded via Ollama and stored in a repo-local Qdrant Edge shard
+3. **Embed**: Chunks are embedded locally with FastEmbed and stored in a repo-local Qdrant Edge shard
 4. **Graph**: Call relationships are persisted as JSON for fast lookup
 
 Indexing is incremental, unchanged files are skipped on reindex.

@@ -9,14 +9,10 @@ Thanks for considering a contribution. This is a small project with a focused sc
 git clone https://github.com/alexandroheredia/compas.git
 cd compas
 
-# 2. Install dependencies
-ollama pull nomic-embed-text
-ollama serve
-
-# 3. Build
+# 2. Build
 cargo build --release
 
-# 4. Run tests
+# 3. Run tests
 cargo test
 ```
 

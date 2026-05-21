@@ -88,12 +88,13 @@ cargo fmt
 3. **Use any initialized repo** as a test target (e.g., a Flutter project)
 4. **Evaluation script** is `scripts/evaluate_compas.py` — 13 queries with gold-standard expected files, P@5 by difficulty
 
-Quick integration test:
+Quick integration test (uses HTTP server for evaluation script):
 
 ```bash
 cd /path/to/your-project
 /path/to/compas/target/release/compas index
-/path/to/compas/target/release/compas serve &
+/path/to/compas/target/release/compas serve
+# In another terminal:
 python3 /path/to/compas/scripts/evaluate_compas.py
 ```
 
@@ -106,9 +107,14 @@ python3 /path/to/compas/scripts/evaluate_compas.py
 
 If `AGENTS.md` already exists, `compas init` skips it so it doesn't overwrite custom instructions.
 
-## Global Daemon (Multi-Repo)
+## HTTP Server (Debugging Only)
 
-`compas serve` is now a **global daemon** that serves ALL your initialized repos from a single process on port 3001.
+`compas serve` provides an HTTP API on port 3001. It is **not required** for MCP or normal agent use.
+
+Use it only when you need:
+- Manual `curl` testing
+- Running the evaluation script (`scripts/evaluate_compas.py`)
+- Multi-repo REST access for scripts
 
 ### How it works
 
@@ -117,50 +123,19 @@ If `AGENTS.md` already exists, `compas init` skips it so it doesn't overwrite cu
 3. API clients pass `?repo=<name>` to select which repo to query
 4. If only one repo is registered, it becomes the default (no `repo` param needed)
 
-### Starting the daemon
+### Starting the server
 
 ```bash
 # Foreground (for testing)
 compas serve
 
-# Background
-nohup compas serve > /tmp/compas.log 2>&1 &
-
-# macOS LaunchAgent (auto-start on login)
-# Create this plist once:
-cat > ~/Library/LaunchAgents/com.github.compas.serve.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.github.compas.serve</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/path/to/compas/target/release/compas</string>
-        <string>serve</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-        <key>Crashed</key>
-        <true/>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>/path/to/logs/compas/daemon.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/path/to/logs/compas/daemon.err.log</string>
-</dict>
-</plist>
-EOF
-
-launchctl load ~/Library/LaunchAgents/com.github.compas.serve.plist
+# Then query:
+curl "http://localhost:3001/search?repo=my-repo&q=auth"
 ```
 
-### Restarting the daemon
+Stop it when done — it does not need to stay running.
+
+### Restarting
 
 `compas serve` auto-detects if another instance is already running on the same port. It kills the old process and starts fresh. Just run it again:
 

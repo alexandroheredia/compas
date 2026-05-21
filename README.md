@@ -36,21 +36,13 @@ cd your-project
 # 3. Index (first run downloads the embedding model)
 /path/to/compas/target/release/compas index
 
-# 4. Start daemon
-/path/to/compas/target/release/compas serve
-
-# 5. Query
-curl "http://localhost:3001/search?q=how+does+caching+work"
+# 4. Set up MCP in your editor
+# See MCP Integration below — no daemon needed
 ```
 
 ## MCP Integration
 
-`compas` has two different runtime modes:
-
-- `compas mcp`: the stdio tool server used by editors and AI agents
-- `compas serve`: the HTTP daemon used for REST, scripts, evals, and multi-repo access
-
-If you are setting up an editor integration, you usually want `compas mcp`. If you want `curl`, the evaluation script, or one long-lived daemon serving multiple repos, use `compas serve`.
+**This is the primary way agents use compas.** Your editor launches `compas mcp` as a stdio tool server. No background daemon is required.
 
 Add to your editor's MCP config:
 
@@ -96,20 +88,25 @@ No wrapper script needed.
 4. Sees called by `LoginScreen._handleSubmit`
 5. Opens the confirmed file, no guessing, no wasted tokens.
 
-## Multi-Repo
+## compas serve (HTTP debugging only)
 
-`compas serve` is a global daemon. Index multiple repos, query them all from one process:
+`compas serve` provides an HTTP API on port 3001. It is **not required** for MCP or normal agent use. Use it only when you need:
+
+- Manual `curl` testing
+- Running the evaluation script (`scripts/evaluate_compas.py`)
+- Multi-repo REST access for scripts
 
 ```bash
-cd repo-a && compas init
-cd repo-b && compas init
-compas serve
+# Start when needed
+/path/to/compas/target/release/compas serve
+
+# Query
 curl "http://localhost:3001/search?repo=repo-b&q=cache"
+
+# Stop when done — it does not need to stay running
 ```
 
 Repos are registered in `~/.config/compas/repos.json`.
-
-This is separate from MCP: your editor can launch `compas mcp` for tool calls while `compas serve` is running for HTTP access and daemon-backed fallback.
 
 ## How It Works
 

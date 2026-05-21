@@ -19,7 +19,7 @@ pub struct RepoConfig {
     pub exclude: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct EmbedderConfig {
     #[serde(default)]
     pub provider: String,

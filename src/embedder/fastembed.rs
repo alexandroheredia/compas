@@ -27,10 +27,9 @@ impl FastEmbedEmbedder {
             .join("fastembed");
         std::fs::create_dir_all(&cache_dir).ok();
 
-        let mut model = TextEmbedding::try_new(
-            InitOptions::new(model_variant).with_cache_dir(cache_dir),
-        )
-        .context("failed to initialize FastEmbed model")?;
+        let mut model =
+            TextEmbedding::try_new(InitOptions::new(model_variant).with_cache_dir(cache_dir))
+                .context("failed to initialize FastEmbed model")?;
         let query_prefix = query_prefix.into();
         let doc_prefix = doc_prefix.into();
 

@@ -10,7 +10,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "search_codebase".into(),
-            description: "Find code in the repository using natural language semantic search. Returns relevant files, functions, classes, and code snippets with file paths and line numbers. Use this when looking for specific functionality, features, or implementations across the entire codebase.".into(),
+            description: "MANDATORY FIRST STEP for any codebase exploration task. Use this BEFORE reading files, listing directories, or searching with regex. Finds code by natural language semantic search and returns the exact files, functions, classes, and line numbers you need. Only read files AFTER this tool confirms their relevance.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -24,7 +24,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "get_symbol_graph".into(),
-            description: "Get the relationships and dependencies for a function, method, or class. Shows what the symbol calls (outgoing dependencies) and what other functions or classes call it (incoming dependencies or callers). Use this to trace code paths, understand impact of changes, or find how a function is used.".into(),
+            description: "Trace callers and callees for a specific symbol. Use AFTER search_codebase when you need to understand how a function or class is used, or what it depends on. Do not use this for discovery — search first, then graph.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

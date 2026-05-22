@@ -6,7 +6,7 @@
 
 **compas** is a local semantic search engine for your codebase. It indexes your code using embeddings + AST analysis, then answers natural language queries like "where is authentication handled?" with ranked, relevant code snippets, complete with file paths, line numbers, and call relationships.
 
-It runs entirely on your machine (Ollama + embedded Qdrant Edge) and exposes its capabilities via MCP so AI agents (Copilot, Claude, Cursor) can search your code without burning tokens on irrelevant files.
+It runs entirely on your machine (FastEmbed + embedded Qdrant Edge) and exposes its capabilities via MCP so AI agents (Copilot, Claude, Cursor) can search your code without burning tokens on irrelevant files.
 
 > **For AI agents setting this up:** Read [`docs/SETUP.md`](docs/SETUP.md) - exact, copy-pasteable commands.
 
@@ -21,39 +21,28 @@ Both are exposed as MCP tools that agents call directly.
 
 ## Quick Start
 
-**Prerequisites:** Rust 1.75+, Ollama
+**Prerequisites:** Rust 1.75+
 
 ```bash
-# 1. Pull embedding model
-ollama pull nomic-embed-text
-
-# 2. Build
+# 1. Build
 git clone https://github.com/alexandroheredia/compas.git
 cd compas
 cargo build --release
 
-# 3. Initialize a project
+# 2. Initialize a project
 cd your-project
 /path/to/compas/target/release/compas init
 
-# 4. Index
+# 3. Index (first run downloads the embedding model)
 /path/to/compas/target/release/compas index
 
-# 5. Start daemon
-/path/to/compas/target/release/compas serve
-
-# 6. Query
-curl "http://localhost:3001/search?q=how+does+caching+work"
+# 4. Set up MCP in your editor
+# See MCP Integration below — no daemon needed
 ```
 
 ## MCP Integration
 
-`compas` has two different runtime modes:
-
-- `compas mcp`: the stdio tool server used by editors and AI agents
-- `compas serve`: the HTTP daemon used for REST, scripts, evals, and multi-repo access
-
-If you are setting up an editor integration, you usually want `compas mcp`. If you want `curl`, the evaluation script, or one long-lived daemon serving multiple repos, use `compas serve`.
+**This is the primary way agents use compas.** Your editor launches `compas mcp` as a stdio tool server. No background daemon is required.
 
 Add to your editor's MCP config:
 
@@ -99,26 +88,31 @@ No wrapper script needed.
 4. Sees called by `LoginScreen._handleSubmit`
 5. Opens the confirmed file, no guessing, no wasted tokens.
 
-## Multi-Repo
+## compas serve (HTTP debugging only)
 
-`compas serve` is a global daemon. Index multiple repos, query them all from one process:
+`compas serve` provides an HTTP API on port 3001. It is **not required** for MCP or normal agent use. Use it only when you need:
+
+- Manual `curl` testing
+- Running the evaluation script (`scripts/evaluate_compas.py`)
+- Multi-repo REST access for scripts
 
 ```bash
-cd repo-a && compas init
-cd repo-b && compas init
-compas serve
+# Start when needed
+/path/to/compas/target/release/compas serve
+
+# Query
 curl "http://localhost:3001/search?repo=repo-b&q=cache"
+
+# Stop when done — it does not need to stay running
 ```
 
 Repos are registered in `~/.config/compas/repos.json`.
-
-This is separate from MCP: your editor can launch `compas mcp` for tool calls while `compas serve` is running for HTTP access and daemon-backed fallback.
 
 ## How It Works
 
 1. **Parse**: Tree-sitter extracts methods, classes, and call relationships from the AST
 2. **Chunk**: Each symbol becomes a chunk enriched with doc comments + source code
-3. **Embed**: Chunks are embedded via Ollama and stored in a repo-local Qdrant Edge shard
+3. **Embed**: Chunks are embedded locally with FastEmbed and stored in a repo-local Qdrant Edge shard
 4. **Graph**: Call relationships are persisted as JSON for fast lookup
 
 Indexing is incremental, unchanged files are skipped on reindex.

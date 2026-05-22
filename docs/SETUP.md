@@ -11,7 +11,7 @@ compas is a local semantic search engine for codebases. It indexes your code usi
 1. **`search_codebase`**: Find code by natural language meaning (not just string matching)
 2. **`get_symbol_graph`**: See who calls what (call graph navigation)
 
-It runs entirely on the user's machine using Ollama (embeddings) and embedded Qdrant Edge (vector database).
+It runs entirely on the user's machine using FastEmbed (local embeddings) and embedded Qdrant Edge (vector database).
 
 ---
 
@@ -31,19 +31,6 @@ If missing, install via [rustup](https://rustup.rs/):
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
-```
-
-### 2. Ollama (for embeddings)
-
-```bash
-ollama --version
-# Expected: any recent version
-```
-
-If missing, install from [ollama.com](https://ollama.com/):
-
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
 ```
 
 ### 3. Git
@@ -73,17 +60,9 @@ ls -la target/release/compas
 The binary path is: `{repo_root}/target/release/compas`
 (Example: `/Users/yourname/GitHub/compas/target/release/compas`)
 
-### Step 2: Pull the Embedding Model
+> **Note:** The embedding model (`nomic-ai/nomic-embed-text-v1.5`) downloads automatically on first `compas index` via FastEmbed. No manual model setup is required.
 
-```bash
-ollama pull nomic-embed-text
-
-# Verify the model is available
-ollama list
-# Expected: nomic-embed-text in the list
-```
-
-### Step 3: Configure MCP in the Editor
+### Step 2: Configure MCP in the Editor
 
 The compas binary exposes an MCP server over stdio. Configure your editor to launch it.
 
@@ -192,9 +171,9 @@ Optimizing edge shard...
 ✓ Edge shard optimized
 ```
 
-### Step 6: Start the Global Daemon (Optional)
+### Step 6: Start the HTTP Server (Optional — Debugging Only)
 
-If you want REST API access or plan to query multiple repos:
+`compas serve` is **not required** for MCP or normal agent use. Start it only when you need HTTP access for manual testing, scripts, or the evaluation script:
 
 ```bash
 {path_to_compas_binary} serve
@@ -206,14 +185,14 @@ Expected output:
 Server running on http://127.0.0.1:3001
 ```
 
-The daemon serves all registered repos. It auto-detects if another instance is running and replaces it.
+Stop it when done — it does not need to stay running.
 
 Important distinction:
 
-- `compas serve` = HTTP daemon on port 3001 for REST, scripts, evals, and multi-repo access
-- `compas mcp` = stdio tool server used by editors/agents via MCP
+- `compas mcp` = stdio tool server used by editors/agents via MCP (**primary mode**)
+- `compas serve` = HTTP server on port 3001 for REST, scripts, and manual debugging only
 
-If you only need editor/agent tool calls, your editor will usually launch `compas mcp` for you from the MCP config. You do not normally need to type `compas mcp` by hand.
+If you only need editor/agent tool calls, your editor will launch `compas mcp` for you from the MCP config. You do not normally need to type `compas mcp` by hand.
 
 ### Step 7: Verify Everything Works
 
@@ -258,18 +237,9 @@ cd /path/to/repo1
 cd /path/to/repo2
 {path_to_compas_binary} init
 {path_to_compas_binary} index
-
-# Both are now served by the same daemon
-{path_to_compas_binary} serve
 ```
 
-Query via REST with `?repo=` parameter:
-
-```bash
-curl "http://localhost:3001/search?repo=repo2&q=cache+logic"
-```
-
-Query via MCP with `repo` parameter:
+Query via MCP with `repo` parameter (no daemon needed):
 
 ```json
 {
@@ -277,6 +247,13 @@ Query via MCP with `repo` parameter:
   "repo": "repo2",
   "limit": 10
 }
+```
+
+If you need HTTP access for scripts or manual testing, start `compas serve` temporarily:
+
+```bash
+{path_to_compas_binary} serve
+curl "http://localhost:3001/search?repo=repo2&q=cache+logic"
 ```
 
 ---

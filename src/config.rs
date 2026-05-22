@@ -19,11 +19,12 @@ pub struct RepoConfig {
     pub exclude: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct EmbedderConfig {
+    #[serde(default)]
     pub provider: String,
+    #[serde(default)]
     pub model: String,
-    pub url: String,
     #[serde(default)]
     pub query_prefix: Option<String>,
     #[serde(default)]
@@ -62,13 +63,10 @@ impl AppConfig {
 
         // Apply defaults
         if cfg.embedder.provider.is_empty() {
-            cfg.embedder.provider = "ollama".into();
+            cfg.embedder.provider = "fastembed".into();
         }
         if cfg.embedder.model.is_empty() {
-            cfg.embedder.model = "nomic-embed-text".into();
-        }
-        if cfg.embedder.url.is_empty() {
-            cfg.embedder.url = "http://localhost:11434".into();
+            cfg.embedder.model = "nomic-ai/nomic-embed-text-v1.5".into();
         }
         if cfg.store.provider.is_empty() {
             cfg.store.provider = "edge".into();

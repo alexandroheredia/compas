@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use compas::{
     chunker::{
-        dart::{extract_calls, extract_semantic_references},
+        dart::extract_semantic_references, extract_calls_for_language, language_for_path,
         ChunkerRegistry,
     },
     config::AppConfig,
@@ -917,9 +917,6 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     store.init(embedder.dimensions()).await?;
 
     let registry = ChunkerRegistry::new();
-    let chunker = registry
-        .get("dart")
-        .ok_or_else(|| anyhow::anyhow!("no dart chunker"))?;
 
     // Load .compasignore patterns
     let compas_ignore = CompasIgnore::load(&repo_path);
@@ -952,7 +949,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         if compas_ignore.is_ignored(relative) {
             continue;
         }
-        if !path.extension().map(|e| e == "dart").unwrap_or(false) {
+        if language_for_path(path).is_none() {
             continue;
         }
 
@@ -1101,6 +1098,25 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
             }
         }
 
+        let language = match language_for_path(path) {
+            Some(language) => language,
+            None => continue,
+        };
+
+        let chunker = match registry.get(language) {
+            Some(chunker) => chunker,
+            None => {
+                if let Some(ref bar) = pb {
+                    bar.println(format!("warning: no {} chunker available", language));
+                    bar.inc(1);
+                } else {
+                    warn!("no {} chunker available", language);
+                }
+                failed += 1;
+                continue;
+            }
+        };
+
         let chunks = match chunker.chunk(path.to_str().unwrap(), &content) {
             Ok(c) => c,
             Err(e) => {
@@ -1142,6 +1158,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
                 }
             }
             if !chunk.content.starts_with("///")
+                && !chunk.content.starts_with("//!")
                 && (chunk.kind == "method"
                     || chunk.kind == "function"
                     || chunk.kind == "constructor")
@@ -1214,7 +1231,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
             graph.add_symbol(&base_symbol, &chunk.file_path, &chunk.kind);
         }
 
-        if let Ok(calls) = extract_calls(&content) {
+        if let Ok(calls) = extract_calls_for_language(language, &content) {
             for (caller, callee) in &calls {
                 graph.add_symbol(caller, path.to_str().unwrap(), "method");
                 graph.add_call(caller, path.to_str().unwrap(), callee);
@@ -1247,6 +1264,16 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
             Err(_) => continue,
         };
 
+        let language = match language_for_path(path) {
+            Some(language) => language,
+            None => continue,
+        };
+
+        let chunker = match registry.get(language) {
+            Some(chunker) => chunker,
+            None => continue,
+        };
+
         let chunks = match chunker.chunk(path_str, &content) {
             Ok(c) => c,
             Err(_) => continue,
@@ -1254,6 +1281,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
 
         for chunk in &chunks {
             if !chunk.content.starts_with("///")
+                && !chunk.content.starts_with("//!")
                 && (chunk.kind == "method"
                     || chunk.kind == "function"
                     || chunk.kind == "constructor")
@@ -1285,7 +1313,13 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         .ok();
     graph.save(&graph_path)?;
 
-    let audit_analysis = build_audit_analysis(&repo_path, &new_manifest);
+    let dart_manifest: std::collections::HashMap<String, String> = new_manifest
+        .iter()
+        .filter(|(path, _)| language_for_path(Path::new(path)) == Some("dart"))
+        .map(|(path, hash)| (path.clone(), hash.clone()))
+        .collect();
+
+    let audit_analysis = build_audit_analysis(&repo_path, &dart_manifest);
     let dead_code_candidates = classify_dead_code_candidates(&audit_analysis);
 
     generate_audit(
@@ -1637,9 +1671,10 @@ impl Handler for ReindexHandler {
         ) {
             return;
         }
-        if !path.extension().map(|e| e == "dart").unwrap_or(false) {
-            return;
-        }
+        let language = match language_for_path(path) {
+            Some(language) => language,
+            None => return,
+        };
 
         info!("reindexing {}", file_path);
 
@@ -1651,10 +1686,10 @@ impl Handler for ReindexHandler {
             }
         };
 
-        let chunker = match self.registry.get("dart") {
+        let chunker = match self.registry.get(language) {
             Some(c) => c,
             None => {
-                warn!("no dart chunker available");
+                warn!("no {} chunker available", language);
                 return;
             }
         };
@@ -1714,7 +1749,7 @@ impl Handler for ReindexHandler {
         }
 
         // Extract call relationships from the AST
-        if let Ok(calls) = extract_calls(&content) {
+        if let Ok(calls) = extract_calls_for_language(language, &content) {
             for (caller, callee) in &calls {
                 graph.add_symbol(caller, file_path, "method");
                 graph.add_call(caller, file_path, callee);

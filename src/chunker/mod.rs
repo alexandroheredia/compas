@@ -1,7 +1,10 @@
 pub mod dart;
+pub mod rust;
 
 #[cfg(test)]
 mod dart_test;
+#[cfg(test)]
+mod rust_test;
 
 use crate::models::Chunk;
 use anyhow::Result;
@@ -19,6 +22,7 @@ impl ChunkerRegistry {
     pub fn new() -> Self {
         let mut r = Self { chunkers: vec![] };
         r.register(Box::new(dart::DartChunker));
+        r.register(Box::new(rust::RustChunker));
         r
     }
 
@@ -37,5 +41,24 @@ impl ChunkerRegistry {
 impl Default for ChunkerRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub fn language_for_path(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("dart") => Some("dart"),
+        Some("rs") => Some("rust"),
+        _ => None,
+    }
+}
+
+pub fn extract_calls_for_language(
+    language: &str,
+    content: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    match language {
+        "dart" => dart::extract_calls(content),
+        "rust" => rust::extract_calls(content),
+        _ => Ok(Vec::new()),
     }
 }

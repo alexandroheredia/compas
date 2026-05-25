@@ -9,14 +9,10 @@ Thanks for considering a contribution. This is a small project with a focused sc
 git clone https://github.com/alexandroheredia/compas.git
 cd compas
 
-# 2. Install dependencies
-docker compose up -d    # Qdrant
-ollama pull nomic-embed-text
-
-# 3. Build
+# 2. Build
 cargo build --release
 
-# 4. Run tests
+# 3. Run tests
 cargo test
 ```
 
@@ -110,7 +106,8 @@ Use any initialized repo as your test target:
 ```bash
 cd /path/to/your-project
 /path/to/compas/target/release/compas index
-/path/to/compas/target/release/compas serve &
+/path/to/compas/target/release/compas serve
+# In another terminal:
 python3 /path/to/compas/scripts/evaluate_compas.py
 ```
 
@@ -121,7 +118,7 @@ If you don't have a suitable repo, use any open source Flutter project (e.g., [f
 ## Architecture Notes
 
 - **Config:** `compas.yaml` in repo root. `AppConfig::load()` reads it.
-- **Global registry:** `~/.config/compas/repos.json` for multi-repo daemon.
+- **Global registry:** `~/.config/compas/repos.json` for multi-repo access.
 - **Graph persistence:** `.compas/graph.json` per repo.
 - **Manifest:** `.compas/manifest.json` for incremental indexing hashes.
 - **Max chunk size:** 6000 chars. Defined as `MAX_CHUNK_CHARS` in `src/chunker/dart.rs`.

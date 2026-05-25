@@ -2,15 +2,15 @@ use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use compas::{
     chunker::{
-        dart::{extract_calls, extract_semantic_references},
+        dart::extract_semantic_references, extract_calls_for_language, language_for_path,
         ChunkerRegistry,
     },
     config::AppConfig,
-    embedder::{ollama::OllamaEmbedder, EmbedMode, Embedder},
+    embedder::{build_embedder, EmbedMode},
     graph::Graph,
     mcp::{self, state::McpAppState},
     server::{router, AppState, RepoState},
-    store::{qdrant::QdrantStore, Store},
+    store::{edge::EdgeStore, Store},
     watcher::{FileWatcher, Handler},
 };
 use indicatif::{ProgressBar, ProgressStyle};
@@ -21,6 +21,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
+
+const EMBED_BATCH_SIZE: usize = 32;
 
 const FLUTTER_LIFECYCLE_METHODS: &[&str] = &[
     "build",
@@ -152,9 +154,11 @@ enum Commands {
     Init,
     /// Index the repository
     Index,
-    /// Start the REST server
+    /// Optimize the local edge shard
+    Optimize,
+    /// Start the HTTP daemon for REST, eval scripts, and multi-repo access
     Serve,
-    /// Start the MCP stdio server for agent integration
+    /// Start the MCP stdio tool server for editors and AI agents
     Mcp,
     /// Watch files and auto-reindex
     Watch,
@@ -173,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
             let config = AppConfig::load(cli.config.to_str().unwrap())?;
             match cmd {
                 Commands::Index => index_repo(config).await,
+                Commands::Optimize => optimize_repo(config).await,
                 Commands::Watch => watch(config).await,
                 Commands::Init | Commands::Serve | Commands::Mcp => unreachable!(),
             }
@@ -197,7 +202,19 @@ fn init_repo() -> anyhow::Result<()> {
         if !entry.file_type().is_file() {
             continue;
         }
-        if let Some(ext) = entry.path().extension() {
+        let path = entry.path();
+        // Skip dependency directories that can skew counts
+        let path_str = path.to_string_lossy();
+        if path_str.contains("/node_modules/")
+            || path_str.contains("/.dart_tool/")
+            || path_str.contains("/target/")
+            || path_str.contains("/.venv/")
+            || path_str.contains("/venv/")
+            || path_str.contains("/vendor/")
+        {
+            continue;
+        }
+        if let Some(ext) = path.extension() {
             let ext = ext.to_string_lossy().to_string();
             if matches!(
                 ext.as_str(),
@@ -208,10 +225,17 @@ fn init_repo() -> anyhow::Result<()> {
         }
     }
 
-    let dominant = counts
+    let mut dominant = counts
         .iter()
         .max_by_key(|(_, c)| *c)
         .map(|(e, _)| e.as_str());
+
+    // If this is a Flutter project (has pubspec.yaml), prefer Dart even if
+    // JS/TS files outnumber it (e.g. node_modules-like contamination).
+    let has_pubspec = cwd.join("pubspec.yaml").exists() || cwd.join("pubspec.yml").exists();
+    if has_pubspec && counts.get("dart").copied().unwrap_or(0) > 0 {
+        dominant = Some("dart");
+    }
 
     let (include, exclude, compasignore_lines) = match dominant {
         Some("dart") => (
@@ -272,8 +296,6 @@ fn init_repo() -> anyhow::Result<()> {
         ),
     };
 
-    let collection = repo_name.to_lowercase().replace(' ', "_").to_string();
-
     let yaml = format!(
         r#"repo:
   path: .
@@ -283,14 +305,13 @@ fn init_repo() -> anyhow::Result<()> {
 {}
 
 embedder:
-  provider: ollama
-  model: nomic-embed-text
-  url: http://localhost:11434
+  provider: fastembed
+  model: nomic-ai/nomic-embed-text-v1.5
 
 store:
-  provider: qdrant
-  url: http://localhost:6333
-  collection: {}
+  provider: edge
+  path: .compas/edge-shard
+  vector_name: default
 
 server:
   host: 127.0.0.1
@@ -310,7 +331,6 @@ index:
             .map(|s| format!("    - \"{}\"", s))
             .collect::<Vec<_>>()
             .join("\n"),
-        collection,
     );
 
     std::fs::write(&config_path, yaml)?;
@@ -335,45 +355,39 @@ index:
     // Write AGENTS.md so agents know to use compas
     let agents_md = r#"# AGENTS.md — Navigation Rules
 
-> **Before opening any file you're uncertain about, search compas.**
-> Do not guess file paths. Query first, read second.
+## MANDATORY RULE
+
+For ANY task where you do not already know the exact file path and line number, your FIRST action MUST be `search_codebase`.
+
+NEVER use `list_dir`, `read_file`, or regex search for initial exploration.
+NEVER browse the directory tree to get oriented before searching.
+NEVER assume you know where code lives because of file names or folder structure.
 
 ## Compas (Local Semantic Search)
 
-This repo is indexed by **compas** — a local semantic code-search engine.
-It finds symbols by natural language meaning (not just filename matching) and knows the call graph.
+This repo is indexed by compas. It finds symbols by natural language meaning and knows the call graph. It is faster and more accurate than manual browsing.
 
-### Tools Available
+### Tools
 
 | Tool | Use When |
 |------|----------|
-| `search_codebase` | You need to find code by concept ("where is auth?", "how does caching work?") |
-| `get_symbol_graph` | You need to trace callers/callees for a specific symbol |
+| `search_codebase` | ALWAYS FIRST. Any time you need to locate, understand, or explore code. |
+| `get_symbol_graph` | After search, when you need to trace callers/callees of a specific symbol. |
 
-### Trigger Phrases (USE COMPAS IMMEDIATELY)
+### Correct Workflow
 
-- "I need to find..."
-- "Where is..."
-- "Which file..."
-- "I'm not sure where..."
-- "Let me check..."
-- "I think it's in..."
-- "Probably in..."
-- "How does X work?"
+1. Search: `search_codebase({ query: "...", limit: 10 })`
+2. Deepen (optional): `get_symbol_graph({ symbol: "..." })`
+3. Read: Open ONLY the exact file(s) and line ranges compas returned
 
-### Workflow
+### What NOT to do
 
-1. **Search**: `search_codebase({ query: "...", limit: 10 })`
-2. **Deepen** (optional): `get_symbol_graph({ symbol: "..." })`
-3. **Read**: Open ONLY the file(s) compas confirmed
-
-### When to Skip Compas
-
-Only skip if you already know the **exact file path and line number**.
+WRONG: Reading `lib/foo/bar.dart` because "the logic is probably there."
+RIGHT: `search_codebase({ query: "how does X work", limit: 10 })` then read only the confirmed results.
 
 ---
 
-*Generated by `compas init`. Update or remove this file as needed.*
+Generated by `compas init`. Update or remove this file as needed.
 "#;
 
     let agents_path = cwd.join("AGENTS.md");
@@ -384,13 +398,136 @@ Only skip if you already know the **exact file path and line number**.
         println!("AGENTS.md already exists. Skipping.");
     }
 
+    // Write compas skill and instructions into .github/ if the folder exists.
+    // These are always overwritten so they stay in sync with the latest compas version.
+    let github_dir = cwd.join(".github");
+    if github_dir.exists() {
+        let skill_md = r#"---
+name: compas
+description: "Codebase semantic search and symbol graph navigation. Use BEFORE opening any file you are not 100% certain about. Triggers on uncertainty: 'I need to find', 'where is', 'which file', 'I'm not sure where', 'let me check', 'I think it's in', 'probably in', 'looks like'. Enforces: query compas first, open only what compas confirms."
+---
+
+## MANDATORY RULE
+
+For ANY task where you do not already know the exact file path and line number, your FIRST action MUST be `search_codebase`.
+
+NEVER use `list_dir`, `read_file`, or regex search for initial exploration.
+NEVER browse the directory tree to get oriented before searching.
+NEVER assume you know where code lives because of file names or folder structure.
+
+## ALWAYS Pass the repo Parameter
+
+This is the most common failure mode. ALWAYS include `repo` in every `search_codebase` and `get_symbol_graph` call.
+
+The MCP server cannot reliably auto-detect which repo you are in because some editors spawn MCP from internal directories, not the workspace root.
+
+If you forget `repo`, you get:
+
+    Error: missing 'repo' parameter and could not auto-detect from cwd.
+
+## Tool: search_codebase
+
+Parameters:
+- query (required): Natural language. Describe what you want, not regex.
+  Good: "user authentication with password hashing"
+  Bad: "class.*Auth" — compas is semantic, not regex
+  Bad: "getUserById" — use `get_symbol_graph` for exact symbols
+- repo (required): ALWAYS pass this.
+- limit (optional): Default 10. Use 15-20 for exploration.
+- language (optional): Filter by language, e.g. "dart".
+
+After receiving results:
+1. Read the top 3-5 previews
+2. Pick the most relevant symbol by score and name
+3. Open ONLY that file
+4. Do NOT open files that did not appear in results
+
+## Tool: get_symbol_graph
+
+Use AFTER finding a relevant symbol to trace its call chain.
+
+Parameters:
+- symbol (required): Symbol name, e.g. "AuthService.authenticate"
+- file (optional): File path to disambiguate
+- repo (required): ALWAYS pass this
+
+## Two-Step Workflow
+
+Step 1 — Search:
+`search_codebase({ query: "how does X work", repo: "...", limit: 15 })`
+
+Step 2 — Deepen (optional):
+`get_symbol_graph({ symbol: "X", repo: "..." })`
+
+Step 3 — Read:
+Open the most relevant file confirmed by both tools.
+
+## Pitfalls
+
+| Pitfall | Fix |
+|---------|-----|
+| Forgetting repo parameter | ALWAYS pass repo in every call |
+| Opening files based on assumptions | ALWAYS search compas first |
+| Using exact symbol names in search_codebase | Use natural language; use get_symbol_graph for exact symbols |
+| Skipping the graph | After finding a symbol, check get_symbol_graph for "how does it work?" |
+
+Generated by compas init. Update or remove this file as needed.
+"#;
+
+        let skills_dir = github_dir.join("skills").join("compas");
+        std::fs::create_dir_all(&skills_dir)?;
+        let skill_path = skills_dir.join("SKILL.md");
+        std::fs::write(&skill_path, skill_md)?;
+        println!("Created .github/skills/compas/SKILL.md");
+
+        let instructions_dir = github_dir.join("instructions");
+        std::fs::create_dir_all(&instructions_dir)?;
+        let instruction_path = instructions_dir.join("repo-navigation.instructions.md");
+        let instructions_md = r#"---
+name: repo-navigation
+description: "Use when exploring, locating, or understanding code in this repository. Enforces search_codebase as the mandatory first action before any file read, directory listing, or regex search. Covers compas tool usage, correct workflow order, and anti-patterns to avoid."
+applyTo: "**"
+---
+
+## MANDATORY RULE
+
+For ANY task where you do not already know the exact file path and line number, your FIRST action MUST be `search_codebase`.
+
+NEVER use `list_dir`, `read_file`, or regex search for initial exploration.
+NEVER browse the directory tree to get oriented before searching.
+NEVER assume you know where code lives because of file names or folder structure.
+
+## Compas (Local Semantic Search)
+
+This repo is indexed by compas. It finds symbols by natural language meaning and knows the call graph. It is faster and more accurate than manual browsing.
+
+### Tools
+
+| Tool | Use When |
+|------|----------|
+| `search_codebase` | ALWAYS FIRST. Any time you need to locate, understand, or explore code. |
+| `get_symbol_graph` | After search, when you need to trace callers/callees of a specific symbol. |
+
+### Correct Workflow
+
+1. Search: `search_codebase({ query: "...", limit: 10 })`
+2. Deepen (optional): `get_symbol_graph({ symbol: "..." })`
+3. Read: Open ONLY the exact file(s) and line ranges compas returned
+
+### What NOT to do
+
+WRONG: Reading `lib/foo/bar.dart` because "the logic is probably there."
+RIGHT: `search_codebase({ query: "how does X work", limit: 10 })` then read only the confirmed results.
+"#;
+        std::fs::write(&instruction_path, instructions_md)?;
+        println!("Created .github/instructions/repo-navigation.instructions.md");
+    }
+
     println!("Created compas.yaml in {:?}", cwd);
     println!("Detected language: {}", dominant.unwrap_or("unknown"));
-    println!("\nNext steps:");
-    println!("  1. Start Qdrant:  docker-compose up -d");
-    println!("  2. Start Ollama:  ollama serve");
-    println!("  3. Index repo:    compas index");
-    println!("  4. Start server:  compas serve");
+    println!("\nNext step:");
+    println!("  Index repo:  compas index");
+    println!("\nThe embedding model downloads once on first index and is cached globally.");
     println!("\nTo make 'compas' available everywhere, copy the binary to your PATH:");
     println!("  cp /path/to/compas/target/release/compas /usr/local/bin/");
 
@@ -771,24 +908,15 @@ fn classify_dead_code_candidates(analysis: &AuditFileAnalysis) -> Vec<DeadCodeCa
 }
 
 async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
-    let embedder = Arc::new(OllamaEmbedder::new(
-        &config.embedder.url,
-        &config.embedder.model,
-        config.embedder.query_prefix.clone().unwrap_or_default(),
-        config.embedder.doc_prefix.clone().unwrap_or_default(),
-    ));
-    let store = Arc::new(QdrantStore::new(
-        &config.store.url,
-        &config.store.collection,
+    let embedder = build_embedder(&config.embedder)?;
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let store = Arc::new(EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
     ));
     store.init(embedder.dimensions()).await?;
 
     let registry = ChunkerRegistry::new();
-    let chunker = registry
-        .get("dart")
-        .ok_or_else(|| anyhow::anyhow!("no dart chunker"))?;
-
-    let repo_path = std::fs::canonicalize(&config.repo.path)?;
 
     // Load .compasignore patterns
     let compas_ignore = CompasIgnore::load(&repo_path);
@@ -821,7 +949,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         if compas_ignore.is_ignored(relative) {
             continue;
         }
-        if !path.extension().map(|e| e == "dart").unwrap_or(false) {
+        if language_for_path(path).is_none() {
             continue;
         }
 
@@ -970,6 +1098,25 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
             }
         }
 
+        let language = match language_for_path(path) {
+            Some(language) => language,
+            None => continue,
+        };
+
+        let chunker = match registry.get(language) {
+            Some(chunker) => chunker,
+            None => {
+                if let Some(ref bar) = pb {
+                    bar.println(format!("warning: no {} chunker available", language));
+                    bar.inc(1);
+                } else {
+                    warn!("no {} chunker available", language);
+                }
+                failed += 1;
+                continue;
+            }
+        };
+
         let chunks = match chunker.chunk(path.to_str().unwrap(), &content) {
             Ok(c) => c,
             Err(e) => {
@@ -1011,6 +1158,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
                 }
             }
             if !chunk.content.starts_with("///")
+                && !chunk.content.starts_with("//!")
                 && (chunk.kind == "method"
                     || chunk.kind == "function"
                     || chunk.kind == "constructor")
@@ -1036,22 +1184,31 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
             }
         }
 
-        let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-        let embeddings = match embedder.embed_batch(&texts, EmbedMode::Document).await {
-            Ok(e) => e,
-            Err(e) => {
-                if let Some(ref bar) = pb {
-                    bar.println(format!("⚠  skip embed error in {}: {}", rel_str, e));
-                } else {
-                    warn!("  skip embed error: {}", e);
+        // Embed in smaller batches to limit peak memory during inference.
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        let mut embed_failed = false;
+        for chunk_batch in chunks.chunks(EMBED_BATCH_SIZE) {
+            let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
+            match embedder.embed_batch(&texts, EmbedMode::Document).await {
+                Ok(batch_embeddings) => embeddings.extend(batch_embeddings),
+                Err(e) => {
+                    if let Some(ref bar) = pb {
+                        bar.println(format!("⚠  skip embed error in {}: {}", rel_str, e));
+                    } else {
+                        warn!("  skip embed error: {}", e);
+                    }
+                    failed += 1;
+                    embed_failed = true;
+                    break;
                 }
-                failed += 1;
-                if let Some(ref bar) = pb {
-                    bar.inc(1);
-                }
-                continue;
             }
-        };
+        }
+        if embed_failed {
+            if let Some(ref bar) = pb {
+                bar.inc(1);
+            }
+            continue;
+        }
 
         if let Err(e) = store.upsert(&chunks, &embeddings).await {
             if let Some(ref bar) = pb {
@@ -1074,7 +1231,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
             graph.add_symbol(&base_symbol, &chunk.file_path, &chunk.kind);
         }
 
-        if let Ok(calls) = extract_calls(&content) {
+        if let Ok(calls) = extract_calls_for_language(language, &content) {
             for (caller, callee) in &calls {
                 graph.add_symbol(caller, path.to_str().unwrap(), "method");
                 graph.add_call(caller, path.to_str().unwrap(), callee);
@@ -1107,6 +1264,16 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
             Err(_) => continue,
         };
 
+        let language = match language_for_path(path) {
+            Some(language) => language,
+            None => continue,
+        };
+
+        let chunker = match registry.get(language) {
+            Some(chunker) => chunker,
+            None => continue,
+        };
+
         let chunks = match chunker.chunk(path_str, &content) {
             Ok(c) => c,
             Err(_) => continue,
@@ -1114,6 +1281,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
 
         for chunk in &chunks {
             if !chunk.content.starts_with("///")
+                && !chunk.content.starts_with("//!")
                 && (chunk.kind == "method"
                     || chunk.kind == "function"
                     || chunk.kind == "constructor")
@@ -1145,7 +1313,13 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         .ok();
     graph.save(&graph_path)?;
 
-    let audit_analysis = build_audit_analysis(&repo_path, &new_manifest);
+    let dart_manifest: std::collections::HashMap<String, String> = new_manifest
+        .iter()
+        .filter(|(path, _)| language_for_path(Path::new(path)) == Some("dart"))
+        .map(|(path, hash)| (path.clone(), hash.clone()))
+        .collect();
+
+    let audit_analysis = build_audit_analysis(&repo_path, &dart_manifest);
     let dead_code_candidates = classify_dead_code_candidates(&audit_analysis);
 
     generate_audit(
@@ -1215,7 +1389,41 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     if !use_tui {
         info!("indexing complete");
     }
+
+    println!("Optimizing edge shard...");
+    let optimized = store.optimize()?;
+    if optimized {
+        println!("✓ Edge shard optimized");
+    } else {
+        println!("✓ Edge shard already optimized");
+    }
+
     Ok(())
+}
+
+async fn optimize_repo(config: AppConfig) -> anyhow::Result<()> {
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let optimized = optimize_edge_shard(&config)?;
+
+    if optimized {
+        println!("Optimized edge shard for {}", repo_path.display());
+    } else {
+        println!(
+            "Edge shard for {} did not require optimization",
+            repo_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn optimize_edge_shard(config: &AppConfig) -> anyhow::Result<bool> {
+    let repo_path = std::fs::canonicalize(&config.repo.path)?;
+    let store = EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
+    );
+    store.optimize()
 }
 
 async fn run_mcp() -> anyhow::Result<()> {
@@ -1227,6 +1435,10 @@ async fn run_mcp() -> anyhow::Result<()> {
     }
 
     let mut repos = HashMap::new();
+    let mut embedder_cache: HashMap<
+        compas::config::EmbedderConfig,
+        Arc<dyn compas::embedder::Embedder>,
+    > = HashMap::new();
     for (name, path) in registry.list() {
         let config_path = std::path::Path::new(path).join("compas.yaml");
         if !config_path.exists() {
@@ -1245,19 +1457,23 @@ async fn run_mcp() -> anyhow::Result<()> {
             }
         };
 
-        let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-            &config.store.url,
-            &config.store.collection,
-        ));
-        let graph = Arc::new(Graph::new());
-        let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
-            &config.embedder.url,
-            &config.embedder.model,
-            config.embedder.query_prefix.clone().unwrap_or_default(),
-            config.embedder.doc_prefix.clone().unwrap_or_default(),
-        ));
-
         let repo_path = std::fs::canonicalize(path)?;
+        let embedder = match embedder_cache.get(&config.embedder) {
+            Some(e) => Arc::clone(e),
+            None => {
+                let e = build_embedder(&config.embedder)?;
+                embedder_cache.insert(config.embedder.clone(), Arc::clone(&e));
+                e
+            }
+        };
+        let edge_store = Arc::new(EdgeStore::new(
+            repo_path.join(&config.store.path),
+            &config.store.vector_name,
+        ));
+        // MCP startup only loads repo descriptors. The shard is opened on demand
+        // when a tool call actually targets this repo.
+        let store: Arc<dyn compas::store::Store> = edge_store;
+        let graph = Arc::new(Graph::new());
         let graph_path = repo_path.join(".compas").join("graph.json");
         if let Err(e) = graph.load(&graph_path) {
             warn!("no existing graph loaded for repo '{}': {}", name, e);
@@ -1302,6 +1518,10 @@ async fn serve() -> anyhow::Result<()> {
     }
 
     let mut repos = HashMap::new();
+    let mut embedder_cache: HashMap<
+        compas::config::EmbedderConfig,
+        Arc<dyn compas::embedder::Embedder>,
+    > = HashMap::new();
     for (name, path) in registry.list() {
         let config_path = std::path::Path::new(path).join("compas.yaml");
         if !config_path.exists() {
@@ -1320,19 +1540,23 @@ async fn serve() -> anyhow::Result<()> {
             }
         };
 
-        let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-            &config.store.url,
-            &config.store.collection,
-        ));
-        let graph = Arc::new(Graph::new());
-        let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
-            &config.embedder.url,
-            &config.embedder.model,
-            config.embedder.query_prefix.clone().unwrap_or_default(),
-            config.embedder.doc_prefix.clone().unwrap_or_default(),
-        ));
-
         let repo_path = std::fs::canonicalize(path)?;
+        let embedder = match embedder_cache.get(&config.embedder) {
+            Some(e) => Arc::clone(e),
+            None => {
+                let e = build_embedder(&config.embedder)?;
+                embedder_cache.insert(config.embedder.clone(), Arc::clone(&e));
+                e
+            }
+        };
+        let edge_store = Arc::new(EdgeStore::new(
+            repo_path.join(&config.store.path),
+            &config.store.vector_name,
+        ));
+        // Daemon startup only loads repo descriptors. The shard is opened on
+        // demand when a request actually targets this repo.
+        let store: Arc<dyn compas::store::Store> = edge_store;
+        let graph = Arc::new(Graph::new());
         let graph_path = repo_path.join(".compas").join("graph.json");
         if let Err(e) = graph.load(&graph_path) {
             warn!("no existing graph loaded for repo '{}': {}", name, e);
@@ -1402,16 +1626,14 @@ async fn serve() -> anyhow::Result<()> {
 
 async fn watch(config: AppConfig) -> anyhow::Result<()> {
     let repo_path = std::fs::canonicalize(&config.repo.path)?;
-    let store: Arc<dyn compas::store::Store> = Arc::new(QdrantStore::new(
-        &config.store.url,
-        &config.store.collection,
+    let embedder = build_embedder(&config.embedder)?;
+    let edge_store = Arc::new(EdgeStore::new(
+        repo_path.join(&config.store.path),
+        &config.store.vector_name,
     ));
-    let embedder: Arc<dyn compas::embedder::Embedder> = Arc::new(OllamaEmbedder::new(
-        &config.embedder.url,
-        &config.embedder.model,
-        config.embedder.query_prefix.clone().unwrap_or_default(),
-        config.embedder.doc_prefix.clone().unwrap_or_default(),
-    ));
+    edge_store.init(embedder.dimensions()).await?;
+    let store: Arc<dyn compas::store::Store> = edge_store;
+    let embedder: Arc<dyn compas::embedder::Embedder> = embedder;
     let handler = ReindexHandler {
         config,
         store,
@@ -1449,9 +1671,10 @@ impl Handler for ReindexHandler {
         ) {
             return;
         }
-        if !path.extension().map(|e| e == "dart").unwrap_or(false) {
-            return;
-        }
+        let language = match language_for_path(path) {
+            Some(language) => language,
+            None => return,
+        };
 
         info!("reindexing {}", file_path);
 
@@ -1463,10 +1686,10 @@ impl Handler for ReindexHandler {
             }
         };
 
-        let chunker = match self.registry.get("dart") {
+        let chunker = match self.registry.get(language) {
             Some(c) => c,
             None => {
-                warn!("no dart chunker available");
+                warn!("no {} chunker available", language);
                 return;
             }
         };
@@ -1488,14 +1711,17 @@ impl Handler for ReindexHandler {
             return;
         }
 
-        let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-        let embeddings = match self.embedder.embed_batch(&texts, EmbedMode::Document).await {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("embed failed for {}: {}", file_path, e);
-                return;
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        for chunk_batch in chunks.chunks(EMBED_BATCH_SIZE) {
+            let texts: Vec<String> = chunk_batch.iter().map(|c| c.content.clone()).collect();
+            match self.embedder.embed_batch(&texts, EmbedMode::Document).await {
+                Ok(batch_embeddings) => embeddings.extend(batch_embeddings),
+                Err(e) => {
+                    warn!("embed failed for {}: {}", file_path, e);
+                    return;
+                }
             }
-        };
+        }
 
         if let Err(e) = self.store.upsert(&chunks, &embeddings).await {
             warn!("upsert failed for {}: {}", file_path, e);
@@ -1523,7 +1749,7 @@ impl Handler for ReindexHandler {
         }
 
         // Extract call relationships from the AST
-        if let Ok(calls) = extract_calls(&content) {
+        if let Ok(calls) = extract_calls_for_language(language, &content) {
             for (caller, callee) in &calls {
                 graph.add_symbol(caller, file_path, "method");
                 graph.add_call(caller, file_path, callee);
@@ -1756,6 +1982,36 @@ fn should_include(path: &std::path::Path, include: &[String], exclude: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("compas-cli-test-{name}-{nanos}"))
+    }
+
+    async fn wait_for_server(port: &str) {
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/health");
+        for _ in 0..50 {
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("server did not become ready on port {port}");
+    }
 
     fn decl(file: &str, symbol: &str, kind: &str) -> AuditDeclaration {
         AuditDeclaration {
@@ -2010,5 +2266,149 @@ mod tests {
 
         assert!(reachable.contains("/repo/lib/main.dart"));
         assert!(reachable.contains("/repo/lib/core/providers/provider_auth.dart"));
+    }
+
+    #[tokio::test]
+    async fn test_init_index_and_search_over_http() {
+        let _guard = test_lock().lock().unwrap();
+
+        let repo_dir = unique_temp_path("repo");
+        let home_dir = unique_temp_path("home");
+        std::fs::create_dir_all(repo_dir.join("lib")).unwrap();
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::write(
+            repo_dir.join("lib").join("auth_service.dart"),
+            r#"class AuthService {
+  Future<String> login(String email, String password) async {
+    return email;
+  }
+}
+"#,
+        )
+        .unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_port = std::env::var_os("COMPAS_PORT");
+
+        let port = ((SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            % 1000)
+            + 31000)
+            .to_string();
+
+        std::env::set_current_dir(&repo_dir).unwrap();
+        std::env::set_var("HOME", &home_dir);
+        std::env::set_var("COMPAS_PORT", &port);
+
+        init_repo().unwrap();
+
+        let config_path = repo_dir.join("compas.yaml");
+        let config_text = std::fs::read_to_string(&config_path).unwrap();
+        let updated = config_text
+            .replace("provider: fastembed", "provider: test")
+            .replace("model: nomic-ai/nomic-embed-text-v1.5", "model: test");
+        std::fs::write(&config_path, updated).unwrap();
+
+        let config = AppConfig::load(config_path.to_str().unwrap()).unwrap();
+        index_repo(config).await.unwrap();
+
+        let serve_handle = tokio::spawn(async { serve().await.unwrap() });
+        wait_for_server(&port).await;
+
+        let response: Value =
+            reqwest::get(format!("http://127.0.0.1:{port}/search?q=authentication"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+
+        let results = response["results"].as_array().unwrap();
+        assert!(
+            !results.is_empty(),
+            "expected search results, got {response}"
+        );
+        let symbols: Vec<&str> = results
+            .iter()
+            .filter_map(|result| result["chunk"]["symbol"].as_str())
+            .collect();
+        assert!(
+            symbols.contains(&"AuthService") || symbols.contains(&"AuthService.login"),
+            "expected auth symbols in results, got {symbols:?}"
+        );
+
+        serve_handle.abort();
+        let _ = serve_handle.await;
+
+        std::env::set_current_dir(original_dir).unwrap();
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_port {
+            Some(value) => std::env::set_var("COMPAS_PORT", value),
+            None => std::env::remove_var("COMPAS_PORT"),
+        }
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+        std::fs::remove_dir_all(&home_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_optimize_edge_shard_succeeds_for_initialized_repo() {
+        let repo_dir = unique_temp_path("optimize");
+        std::fs::create_dir_all(repo_dir.join(".compas")).unwrap();
+
+        let config = AppConfig {
+            repo: compas::config::RepoConfig {
+                path: repo_dir.to_string_lossy().to_string(),
+                include: vec!["lib/**/*.dart".into()],
+                exclude: vec![],
+            },
+            embedder: compas::config::EmbedderConfig {
+                provider: "fastembed".into(),
+                model: "nomic-ai/nomic-embed-text-v1.5".into(),
+                query_prefix: None,
+                doc_prefix: None,
+            },
+            store: compas::config::StoreConfig {
+                provider: "edge".into(),
+                path: ".compas/edge-shard".into(),
+                vector_name: "default".into(),
+            },
+            server: compas::config::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: "3001".into(),
+            },
+            index: compas::config::IndexConfig {
+                chunk_by: "function".into(),
+                watch: true,
+            },
+        };
+
+        let store = EdgeStore::new(repo_dir.join(&config.store.path), &config.store.vector_name);
+        store.init(4).await.unwrap();
+        drop(store);
+
+        let _ = optimize_edge_shard(&config).unwrap();
+
+        std::fs::remove_dir_all(&repo_dir).unwrap();
+    }
+
+    #[test]
+    fn test_watch_include_patterns_match_nested_dart_files() {
+        assert!(should_include(
+            Path::new("lib/services/auth_service.dart"),
+            &["lib/**/*.dart".into()],
+            &[]
+        ));
+        assert!(!should_include(
+            Path::new("build/generated/auth_service.g.dart"),
+            &["lib/**/*.dart".into()],
+            &["**/*.g.dart".into(), "build/**".into()]
+        ));
     }
 }

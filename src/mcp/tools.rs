@@ -2,6 +2,7 @@ use super::state::{McpAppState, RepoState};
 use super::types::*;
 use crate::embedder::EmbedMode;
 use crate::models::SearchResult;
+use crate::search::rerank_results;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -9,29 +10,29 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "search_codebase".into(),
-            description: "Find code in the repository using natural language semantic search. Returns relevant files, functions, classes, and code snippets with file paths and line numbers. Use this when looking for specific functionality, features, or implementations across the entire codebase.".into(),
+            description: "MANDATORY FIRST STEP for any codebase exploration task. Use this BEFORE reading files, listing directories, or searching with regex. Finds code by natural language semantic search and returns the exact files, functions, classes, and line numbers you need. Only read files AFTER this tool confirms their relevance.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Natural language query describing what you are looking for (e.g. 'user authentication', 'image caching', 'database models')" },
-                    "limit": { "type": "number", "description": "Maximum number of results to return (default: 5)" },
+                    "limit": { "type": "number", "description": "Maximum number of results to return (default: 10)" },
                     "language": { "type": "string", "description": "Optional language filter, e.g. 'dart'" },
-                    "repo": { "type": "string", "description": "Optional repo name (e.g. 'my-app'). Only needed if the daemon serves multiple repos." }
+                    "repo": { "type": "string", "description": "Repository name (e.g. 'my-app'). Always pass this to avoid cwd auto-detection failures." }
                 },
-                "required": ["query"]
+                "required": ["query", "repo"]
             }),
         },
         ToolDefinition {
             name: "get_symbol_graph".into(),
-            description: "Get the relationships and dependencies for a function, method, or class. Shows what the symbol calls (outgoing dependencies) and what other functions or classes call it (incoming dependencies or callers). Use this to trace code paths, understand impact of changes, or find how a function is used.".into(),
+            description: "Trace callers and callees for a specific symbol. Use AFTER search_codebase when you need to understand how a function or class is used, or what it depends on. Do not use this for discovery — search first, then graph.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "symbol": { "type": "string", "description": "Name of the function, method, or class to analyze (e.g. 'AuthService.login', 'CacheService', 'getUserById')" },
                     "file": { "type": "string", "description": "Optional file path to disambiguate symbols with the same name, e.g. 'lib/services/auth_service.dart'" },
-                    "repo": { "type": "string", "description": "Optional repo name (e.g. 'my-app'). Only needed if the daemon serves multiple repos." }
+                    "repo": { "type": "string", "description": "Repository name (e.g. 'my-app'). Always pass this to avoid cwd auto-detection failures." }
                 },
-                "required": ["symbol"]
+                "required": ["symbol", "repo"]
             }),
         },
     ]
@@ -40,7 +41,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
 fn resolve_repo<'a>(
     state: &'a McpAppState,
     args: &serde_json::Value,
-) -> Result<&'a RepoState, String> {
+) -> Result<(&'a str, &'a RepoState), String> {
     let repo_name = args["repo"]
         .as_str()
         .map(|s| s.to_string())
@@ -68,7 +69,7 @@ fn resolve_repo<'a>(
         .repos
         .iter()
         .find(|(name, _)| name.to_lowercase() == repo_name.to_lowercase())
-        .map(|(_, repo)| repo)
+        .map(|(name, repo)| (name.as_str(), repo))
         .ok_or_else(|| format!("repo '{}' not found", repo_name))
 }
 
@@ -92,7 +93,7 @@ async fn handle_search(
     let limit = args["limit"].as_u64().unwrap_or(10) as usize;
     let language = args["language"].as_str();
 
-    let repo = resolve_repo(state, args)?;
+    let (_, repo) = resolve_repo(state, args)?;
 
     let embedding = repo
         .embedder
@@ -105,104 +106,26 @@ async fn handle_search(
         filters.insert("language".into(), lang.into());
     }
 
-    let raw_results = repo
-        .store
-        .search(&embedding, limit * 3, &filters)
-        .await
-        .map_err(|e| format!("search failed: {}", e))?;
+    let results = match repo.store.search(&embedding, limit * 3, &filters).await {
+        Ok(raw_results) => rerank_results(repo.graph.as_ref(), raw_results, query, limit),
+        Err(e) => return Err(format!("search failed: {}", e)),
+    };
 
-    // Boost scores based on keyword matches in symbol name, file path, kind,
-    // graph relationships, and private-helper penalty.
-    let query_lower = query.to_lowercase();
-    let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
-    let query_mentions_private = query_tokens
-        .iter()
-        .any(|t| *t == "private" || *t == "helper" || *t == "internal" || *t == "implementation");
-    let boosted: Vec<SearchResult> = raw_results
-        .into_iter()
-        .map(|mut r| {
-            let symbol_lower = r.chunk.symbol.to_lowercase();
-            let file_lower = r.chunk.file_path.to_lowercase();
-            let mut boost = 0.0f32;
-            for token in &query_tokens {
-                if symbol_lower.contains(token) {
-                    boost += 0.12;
-                }
-                if file_lower.contains(token) {
-                    boost += 0.10;
-                }
-            }
-            match r.chunk.kind.as_str() {
-                "class" => boost += 0.05,
-                "method" => boost += 0.02,
-                _ => {}
-            }
-            // Graph cross-reference boost: if callers or callees contain query tokens,
-            // the symbol is likely part of the relevant subsystem even if its own text
-            // doesn't mention the query terms.
-            if let Some(node) = repo.graph.get(&r.chunk.symbol, &r.chunk.file_path) {
-                let related: Vec<String> = node
-                    .calls
-                    .iter()
-                    .chain(node.called_by.iter())
-                    .map(|s| s.to_lowercase())
-                    .collect();
-                for token in &query_tokens {
-                    if related.iter().any(|s| s.contains(token)) {
-                        boost += 0.10;
-                        break; // one boost per result regardless of how many relations match
-                    }
-                }
-            }
-            // Penalise private helpers unless the user is explicitly looking for them.
-            if r.chunk.symbol.starts_with('_') && !query_mentions_private {
-                boost -= 0.15;
-            }
-            r.score += boost;
-            r
-        })
-        .collect();
+    let text = format_search_results(&results);
 
-    // Deduplicate by (file_path, stripped_symbol) so different symbols from the
-    // same file are preserved, but part-chunks (_p1, _p2) of the same symbol are collapsed.
-    // Cap at 3 symbols per file to preserve diversity across the codebase.
-    fn strip_part_suffix(name: &str) -> &str {
-        name.rfind("_p")
-            .and_then(|i| name[i + 2..].parse::<u32>().ok().map(|_| &name[..i]))
-            .unwrap_or(name)
-    }
-    let mut best_by_symbol: std::collections::HashMap<(String, String), SearchResult> =
-        std::collections::HashMap::new();
-    for r in boosted {
-        let stripped = strip_part_suffix(&r.chunk.symbol).to_string();
-        let key = (r.chunk.file_path.clone(), stripped);
-        let should_insert = match best_by_symbol.get(&key) {
-            Some(existing) => r.score > existing.score,
-            None => true,
-        };
-        if should_insert {
-            best_by_symbol.insert(key, r);
-        }
-    }
+    Ok(ToolCallResult {
+        content: vec![ToolContent {
+            kind: "text".into(),
+            text,
+        }],
+        is_error: None,
+    })
+}
 
-    let mut file_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    let mut results: Vec<SearchResult> = best_by_symbol.into_values().collect();
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-    results.retain(|r| {
-        let count = file_counts.entry(r.chunk.file_path.clone()).or_insert(0);
-        if *count < 3 {
-            *count += 1;
-            true
-        } else {
-            false
-        }
-    });
-    results.truncate(limit);
-
+fn format_search_results(results: &[SearchResult]) -> String {
     let repo_path = std::env::current_dir().unwrap_or_default();
 
-    let text = if results.is_empty() {
+    if results.is_empty() {
         "No relevant code found.".into()
     } else {
         let mut lines = vec![format!("Found {} relevant file(s):", results.len())];
@@ -229,15 +152,7 @@ async fn handle_search(
             lines.push(format!("   Preview:\n```dart\n{}...\n```", preview));
         }
         lines.join("\n")
-    };
-
-    Ok(ToolCallResult {
-        content: vec![ToolContent {
-            kind: "text".into(),
-            text,
-        }],
-        is_error: None,
-    })
+    }
 }
 
 async fn handle_graph(
@@ -247,7 +162,7 @@ async fn handle_graph(
     let symbol = args["symbol"].as_str().ok_or("missing 'symbol' argument")?;
     let file = args["file"].as_str().unwrap_or("");
 
-    let repo = resolve_repo(state, args)?;
+    let (_, repo) = resolve_repo(state, args)?;
 
     // Try exact lookup first
     let exact = repo.graph.get(symbol, file);
@@ -286,4 +201,95 @@ async fn handle_graph(
         }],
         is_error: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedder::{EmbedMode, Embedder};
+    use crate::graph::Graph;
+    use crate::mcp::state::RepoState;
+    use crate::models::Chunk;
+    use crate::store::Store;
+    use anyhow::Result;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct FakeEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FakeEmbedder {
+        async fn embed(&self, _text: &str, _mode: EmbedMode) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0, 0.0, 0.0])
+        }
+
+        async fn embed_batch(&self, texts: &[String], _mode: EmbedMode) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn search_codebase_reads_from_edge_store_without_daemon_fallback() {
+        let _guard = env_lock().lock().unwrap();
+
+        let shard_path =
+            std::env::temp_dir().join(format!("compas-mcp-tools-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(crate::store::edge::EdgeStore::new(&shard_path, "default"));
+        store.init(4).await.unwrap();
+        store
+            .upsert(
+                &[Chunk {
+                    id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                    content: "auth_service.dart AuthService.login\nFuture<void> login() async {}"
+                        .to_string(),
+                    language: "dart".to_string(),
+                    file_path: "/tmp/lib/auth_service.dart".to_string(),
+                    symbol: "AuthService.login".to_string(),
+                    line_start: 1,
+                    line_end: 2,
+                    kind: "method".to_string(),
+                    meta: Default::default(),
+                }],
+                &[vec![1.0, 0.0, 0.0, 0.0]],
+            )
+            .await
+            .unwrap();
+
+        let state = McpAppState {
+            repos: HashMap::from([(
+                "bookswipe".to_string(),
+                RepoState {
+                    store,
+                    graph: Arc::new(Graph::new()),
+                    embedder: Arc::new(FakeEmbedder),
+                },
+            )]),
+            default_repo: Some("bookswipe".to_string()),
+        };
+
+        let result = handle_tool_call(
+            &state,
+            "search_codebase",
+            &json!({"query": "authentication", "repo": "bookswipe", "limit": 5}),
+        )
+        .await
+        .unwrap();
+
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("AuthService.login"),
+            "unexpected search text: {text}"
+        );
+
+        std::fs::remove_dir_all(shard_path).unwrap();
+    }
 }

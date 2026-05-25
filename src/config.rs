@@ -19,11 +19,12 @@ pub struct RepoConfig {
     pub exclude: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct EmbedderConfig {
+    #[serde(default)]
     pub provider: String,
+    #[serde(default)]
     pub model: String,
-    pub url: String,
     #[serde(default)]
     pub query_prefix: Option<String>,
     #[serde(default)]
@@ -33,8 +34,10 @@ pub struct EmbedderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreConfig {
     pub provider: String,
-    pub url: String,
-    pub collection: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub vector_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,22 +63,19 @@ impl AppConfig {
 
         // Apply defaults
         if cfg.embedder.provider.is_empty() {
-            cfg.embedder.provider = "ollama".into();
+            cfg.embedder.provider = "fastembed".into();
         }
         if cfg.embedder.model.is_empty() {
-            cfg.embedder.model = "nomic-embed-text".into();
-        }
-        if cfg.embedder.url.is_empty() {
-            cfg.embedder.url = "http://localhost:11434".into();
+            cfg.embedder.model = "nomic-ai/nomic-embed-text-v1.5".into();
         }
         if cfg.store.provider.is_empty() {
-            cfg.store.provider = "qdrant".into();
+            cfg.store.provider = "edge".into();
         }
-        if cfg.store.url.is_empty() {
-            cfg.store.url = "http://localhost:6333".into();
+        if cfg.store.path.is_empty() {
+            cfg.store.path = ".compas/edge-shard".into();
         }
-        if cfg.store.collection.is_empty() {
-            cfg.store.collection = "compas".into();
+        if cfg.store.vector_name.is_empty() {
+            cfg.store.vector_name = "default".into();
         }
         if cfg.server.port.is_empty() {
             cfg.server.port = "3001".into();

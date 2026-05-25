@@ -3,16 +3,23 @@ name: compas
 description: "Codebase semantic search and symbol graph navigation. Use BEFORE opening any file you are not 100% certain about. Triggers on uncertainty: 'I need to find', 'where is', 'which file', 'I'm not sure where', 'let me check', 'I think it's in', 'probably in', 'looks like'. Enforces: query compas first, open only what compas confirms."
 ---
 
-You are an AI agent using compas, a local semantic search engine for codebases. Follow these rules exactly.
+You are an AI agent using compas through OpenCode's MCP integration. Follow these rules exactly.
+
+## OpenCode Notes
+
+- In this repo, compas is configured as a local OpenCode MCP server named `compas` in `opencode.json`.
+- Prefer the MCP tools exposed by that server. Do not rely on the HTTP daemon for normal agent work.
+- In OpenCode, the tools may be exposed with the MCP server prefix, such as `compas_search_codebase` and `compas_get_symbol_graph`.
+- Treat the tool names in this skill as conceptual. Use the matching compas MCP tools that OpenCode exposes in the current session.
 
 ## Rule 1: Search First, Open Second
 
-Before opening ANY file you are not 100% certain about, call `search_codebase`.
+Before opening ANY file you are not 100% certain about, call the compas search tool.
 
 BAD: "The auth logic is probably in lib/services/auth.dart" → opens file → wrong file.
-GOOD: Call `search_codebase` → get ranked results → open confirmed file.
+GOOD: Call the compas search tool → get ranked results → open confirmed file.
 
-### When to Use `search_codebase`
+### When to Use the Compas Search Tool
 
 | Trigger Phrase          | Example                                       |
 | ----------------------- | --------------------------------------------- |
@@ -33,7 +40,7 @@ GOOD: Call `search_codebase` → get ranked results → open confirmed file.
 - You need cross-file relationships (who calls this function?)
 - You are exploring an unfamiliar area of the codebase
 
-**Skip `search_codebase` ONLY** when you already know the exact file path and line number.
+**Skip compas search ONLY** when you already know the exact file path and line number.
 
 ---
 
@@ -57,7 +64,7 @@ How to find the repo name:
 
 ---
 
-## Tool: `search_codebase`
+## Tool: Compas Search
 
 ```json
 {
@@ -86,7 +93,7 @@ How to find the repo name:
 
 ---
 
-## Tool: `get_symbol_graph`
+## Tool: Compas Symbol Graph
 
 Use AFTER finding a relevant symbol to trace its call chain.
 
@@ -143,11 +150,13 @@ Open the most relevant file confirmed by both tools.
 ## If Search Returns Nothing
 
 1. Rephrase with synonyms:
-  - `"AI"` → `"Claude"` or `"OpenAI"`
-  - `"metadata"` → `"product details"` or `"book info"`
-  - `"cache"` → `"storage"` or `"offline"`
+   - `"AI"` → `"Claude"` or `"OpenAI"`
+   - `"metadata"` → `"product details"` or `"book info"`
+   - `"cache"` → `"storage"` or `"offline"`
 2. Try a broader query with a higher limit
-3. Fall back to `grep` ONLY after compas fails — log the miss
+3. Fall back to text search tools ONLY after compas fails — log the miss
+
+If the compas MCP tool fails, report the exact MCP failure rather than silently switching to guessed file paths.
 
 ---
 
@@ -157,7 +166,7 @@ Open the most relevant file confirmed by both tools.
 | --------------------------------------------- | ------------------------------------------------------------------------ |
 | Forgetting `repo` parameter                   | ALWAYS pass `repo` in every call                                         |
 | Opening files based on assumptions            | ALWAYS search compas first                                               |
-| Using exact symbol names in `search_codebase` | Use natural language; use `get_symbol_graph` for exact symbols           |
+| Using exact symbol names in compas search     | Use natural language; use the symbol graph tool for exact symbols        |
 | Ignoring low scores (< 0.6)                   | Rephrase the query — vocabulary mismatch                                 |
 | Skipping the graph                            | After finding a symbol, check `get_symbol_graph` for "how does it work?" |
 | Giving up after one query                     | Rephrase and retry before reaching for grep                              |
@@ -170,9 +179,9 @@ Open the most relevant file confirmed by both tools.
 User asks about code location or behavior?
   ├─ Do you know the EXACT file and line? → Open directly
   └─ Any uncertainty at all?
-      ├─ search_codebase(query, repo="...")
+      ├─ compas search(query, repo="...")
       ├─ Relevant symbol found?
-      │   ├─ User asks "how does it work?" → get_symbol_graph(symbol, repo="...")
+      │   ├─ User asks "how does it work?" → compas symbol graph(symbol, repo="...")
       │   └─ Open confirmed file
       └─ No relevant symbol?
           ├─ Rephrase query (synonyms)
@@ -195,7 +204,7 @@ User asks about code location or behavior?
 **GOOD:**
 
 > User: "How does authentication work?"
-> Agent: Calls `search_codebase("user authentication password login", limit=15, repo="my-app")`
+> Agent: Calls the compas search tool with `query="user authentication password login", limit=15, repo="my-app"`
 > Agent: Gets `AuthService.authenticateUser` as #1 result
-> Agent: Calls `get_symbol_graph("AuthService.authenticateUser", repo="my-app")`
+> Agent: Calls the compas symbol graph tool for `AuthService.authenticateUser` with `repo="my-app"`
 > Agent: Opens `lib/services/auth_service.dart` confirmed by both tools

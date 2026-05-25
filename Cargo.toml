@@ -1,6 +1,6 @@
 [package]
 name = "compas"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Alexandro Heredia <alexandro@heredia.fi>"]
 description = "Local-first semantic search engine for codebases"
@@ -26,6 +26,7 @@ notify = { version = "6", default-features = false, features = ["macos_kqueue"] 
 indicatif = "0.17"
 tree-sitter = "0.26"
 tree-sitter-dart = "0.1"
+tree-sitter-rust = "0.24.2"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -34,3 +35,6 @@ walkdir = "2"
 globset = "0.4"
 regex = "1"
 dirs = "5"
+fs4 = "0.8"
+qdrant-edge = "0.6.1"
+fastembed = "5"

@@ -121,19 +121,20 @@ Indexing is incremental, unchanged files are skipped on reindex.
 
 ## Language Support
 
-Currently **Dart/Flutter** only. TypeScript and Python support is on the roadmap.
+Currently supports **Dart/Flutter** and **Rust**. TypeScript and Python support are on the roadmap.
 
-> **Want to add a language?** Check the [contributing guide](CONTRIBUTING.md). It's ~200 lines of Rust to implement a new chunker.
+> **Want to add a language?** Check the [contributing guide](CONTRIBUTING.md).
 
 ## Limitations
 
-- Dart/Flutter only (other languages need a Tree-sitter grammar + chunker)
+- Only Dart/Flutter and Rust are currently supported (other languages need a Tree-sitter grammar + chunker)
 - Embedding model vocabulary gaps: "AI" may not match "Claude", "metadata" may not match "product info"
 - Dynamic dispatch (e.g., `Function.call`) isn't traced in the graph
 
 ## Roadmap
 
 - [x] Ignore files with something like `.compasignore`
+- [x] Rust support
 - [ ] TypeScript/JavaScript support
 - [ ] Python support
 - [ ] Graph-enriched chunk indexing

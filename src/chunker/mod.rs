@@ -9,6 +9,25 @@ mod rust_test;
 use crate::models::Chunk;
 use anyhow::Result;
 
+pub(crate) fn truncate_content(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+
+    let mut end = max_bytes.min(content.len());
+    while end < content.len() && !content.is_char_boundary(end) {
+        end += 1;
+    }
+
+    if let Some(newline_offset) = content[end..].find('\n') {
+        end += newline_offset + 1;
+    } else {
+        end = content.len();
+    }
+
+    content[..end].to_string()
+}
+
 pub trait Chunker: Send + Sync {
     fn language(&self) -> &'static str;
     fn chunk(&self, file_path: &str, content: &str) -> Result<Vec<Chunk>>;

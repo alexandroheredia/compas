@@ -1,6 +1,6 @@
 #![allow(clippy::missing_transmute_annotations)]
 
-use crate::chunker::Chunker;
+use crate::chunker::{truncate_content, Chunker};
 use crate::models::Chunk;
 use anyhow::Result;
 use tree_sitter::{Node, Parser};
@@ -616,20 +616,6 @@ fn push_chunk(
         offset = end;
         part += 1;
     }
-}
-
-fn truncate_content(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
-        return content.to_string();
-    }
-    let mut end = max_chars;
-    while end < content.len() && !content[..end].ends_with('\n') {
-        end += 1;
-    }
-    if end >= content.len() {
-        end = content.len();
-    }
-    content[..end].to_string()
 }
 
 fn byte_to_line(content: &str, byte_pos: usize) -> usize {

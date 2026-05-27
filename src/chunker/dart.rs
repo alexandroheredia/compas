@@ -1,6 +1,6 @@
 #![allow(clippy::missing_transmute_annotations)]
 
-use crate::chunker::Chunker;
+use crate::chunker::{truncate_content, Chunker};
 use crate::models::Chunk;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -431,20 +431,6 @@ pub fn extract_doc_comments(content: &str, start_byte: usize) -> String {
 
     comments.reverse();
     comments.join("\n")
-}
-
-fn truncate_content(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
-        return content.to_string();
-    }
-    let mut end = max_chars;
-    while end < content.len() && !content[..end].ends_with('\n') {
-        end += 1;
-    }
-    if end >= content.len() {
-        end = content.len();
-    }
-    content[..end].to_string()
 }
 
 /// Replace long string literals (>120 chars) with `'...'` so they don't dilute embeddings.

@@ -3,7 +3,7 @@ mod tests {
     use crate::chunker::dart::{
         extract_calls, extract_doc_comments, extract_semantic_references, DartChunker,
     };
-    use crate::chunker::Chunker;
+    use crate::chunker::{truncate_content, Chunker};
     use tree_sitter::{Node, Parser};
 
     fn init_parser() -> Parser {
@@ -61,6 +61,13 @@ void topLevel() {
         println!("{}", result);
         assert!(result.contains("'...'"));
         assert!(result.contains("'short'"));
+    }
+
+    #[test]
+    fn test_truncate_content_handles_unicode_boundary() {
+        let content = format!("{}🤪\nrest", "a".repeat(5999));
+        let truncated = truncate_content(&content, 6000);
+        assert_eq!(truncated, format!("{}🤪\n", "a".repeat(5999)));
     }
 
     #[test]
@@ -406,6 +413,18 @@ class CacheService {
         assert!(method_chunk
             .content
             .contains("cache_service.dart CacheService.saveAll"));
+    }
+
+    #[test]
+    fn test_long_dart_chunk_with_emoji_splits_without_panic() {
+        let repeated = "    final emoji = '🤪';\n".repeat(400);
+        let code = format!("class Foo {{\n  void huge() {{\n{repeated}  }}\n}}\n");
+
+        let chunker = DartChunker;
+        let chunks = chunker.chunk("lib/foo.dart", &code).unwrap();
+
+        assert!(chunks.iter().any(|c| c.symbol == "Foo.huge_p1"));
+        assert!(chunks.iter().any(|c| c.symbol == "Foo.huge_p2"));
     }
 
     #[test]

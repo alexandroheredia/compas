@@ -1,10 +1,7 @@
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use compas::{
-    chunker::{
-        dart::extract_semantic_references, extract_calls_for_language, language_for_path,
-        ChunkerRegistry,
-    },
+    chunker::{extract_calls_for_language, language_for_path, ChunkerRegistry},
     config::AppConfig,
     embedder::{build_embedder, EmbedMode},
     graph::Graph,
@@ -14,128 +11,24 @@ use compas::{
     watcher::{FileWatcher, Handler},
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
 const EMBED_BATCH_SIZE: usize = 32;
-
-const FLUTTER_LIFECYCLE_METHODS: &[&str] = &[
-    "build",
-    "createState",
-    "initState",
-    "dispose",
-    "didChangeDependencies",
-    "didUpdateWidget",
-    "didChangeAppLifecycleState",
-    "deactivate",
-    "activate",
-    "reassemble",
-    "setState",
-    "mount",
-    "unmount",
-];
-
-const FLUTTER_CALLBACK_SUFFIXES: &[&str] = &[
-    "onPressed",
-    "onTap",
-    "onChanged",
-    "onSaved",
-    "onSubmitted",
-    "onEditingComplete",
-];
-
-/// Members that are dispatched by frameworks/runtime, not by direct call sites.
-/// These should never be flagged as dead code because the absence of a reference
-/// in source is meaningless — Flutter, Dart, json_serializable, etc. call them.
-const FRAMEWORK_DISPATCHED_MEMBERS: &[&str] = &[
-    // Flutter widget lifecycle
-    "build",
-    "createState",
-    "initState",
-    "dispose",
-    "didChangeDependencies",
-    "didUpdateWidget",
-    "didChangeAppLifecycleState",
-    "deactivate",
-    "activate",
-    "reassemble",
-    "mount",
-    "unmount",
-    // InheritedWidget / InheritedNotifier
-    "updateShouldNotify",
-    "updateShouldNotifyDependent",
-    // ChangeNotifier / Listenable
-    "notifyListeners",
-    "addListener",
-    "removeListener",
-    // Dart object protocol
-    "toString",
-    "toJson",
-    "fromJson",
-    "fromMap",
-    "toMap",
-    "fromSnapshot",
-    "fromDoc",
-    "fromDocument",
-    "noSuchMethod",
-    "hashCode",
-    // App entrypoint
-    "main",
-    // Flutter render/paint hooks
-    "paint",
-    "shouldRepaint",
-    "shouldRebuildSemantics",
-    "performLayout",
-    "performResize",
-    // Stream/Future protocol
-    "call",
-];
-
-fn is_framework_dispatched(member_name: &str) -> bool {
-    if FRAMEWORK_DISPATCHED_MEMBERS.contains(&member_name) {
-        return true;
-    }
-    // operator overloads (==, +, -, [], etc.) are dispatched by the runtime
-    if member_name.starts_with("operator ") {
-        return true;
-    }
-    false
-}
-
-#[derive(Debug, Clone)]
-struct AuditDeclaration {
-    file: String,
-    display_file: String,
-    symbol: String,
-    kind: String,
-}
-
-#[derive(Debug, Clone)]
-struct AuditReference {
-    #[allow(dead_code)]
-    caller_file: String,
-    callee: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct AuditFileAnalysis {
-    declarations: Vec<AuditDeclaration>,
-    references: Vec<AuditReference>,
-    file_edges: Vec<(String, String)>,
-    key_types: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct DeadCodeCandidate {
-    file: String,
-    symbol: String,
-    kind: String,
-}
+const COMPAS_LOGO: &str = r#"     @@@@@@@   @@@@@@   @@@@@@@@@@   @@@@@@@    @@@@@@    @@@@@@
+     @@@@@@@@  @@@@@@@@  @@@@@@@@@@@  @@@@@@@@  @@@@@@@@  @@@@@@@
+     !@@       @@!  @@@  @@! @@! @@!  @@!  @@@  @@!  @@@  !@@
+     !@!       !@!  @!@  !@! !@! !@!  !@!  @!@  !@!  @!@  !@!
+     !@!       @!@  !@!  @!! !!@ @!@  @!@@!@!   @!@!@!@!  !!@@!!
+     !!!       !@!  !!!  !@!   ! !@!  !!@!!!    !!!@!!!!   !!@!!!
+     :!!       !!:  !!!  !!:     !!:  !!:       !!:  !!!       !:!
+     :!:       :!:  !:!  :!:     :!:  :!:       :!:  !:!      !:!
+      ::: :::  ::::: ::  :::     ::    ::       ::   :::  :::: ::
+      :: :: :   : :  :    :      :     :         :   : :  :: : :"#;
 
 #[derive(Parser)]
 #[command(name = "compas")]
@@ -542,13 +435,14 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finish())
 }
 
-fn is_flutter_boilerplate(symbol: &str) -> bool {
-    let method_name = symbol.rsplit('.').next().unwrap_or(symbol);
-    FLUTTER_LIFECYCLE_METHODS.contains(&method_name)
-}
-
 struct CompasIgnore {
     matchers: Vec<globset::GlobMatcher>,
+}
+
+fn progress_bar_template() -> String {
+    format!(
+        "{{spinner:.green}} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} {{msg}}\n{COMPAS_LOGO}"
+    )
 }
 
 impl CompasIgnore {
@@ -587,324 +481,6 @@ impl CompasIgnore {
         }
         false
     }
-}
-
-fn relative_display_path(repo_path: &Path, file: &Path) -> String {
-    file.strip_prefix(repo_path)
-        .unwrap_or(file)
-        .to_string_lossy()
-        .to_string()
-}
-
-fn audit_path_filename(file_path: &str) -> String {
-    Path::new(file_path)
-        .file_name()
-        .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| file_path.to_string())
-}
-
-fn normalize_relative_uri(base_file: &Path, uri: &str) -> String {
-    base_file
-        .parent()
-        .unwrap_or(base_file)
-        .join(uri)
-        .components()
-        .collect::<std::path::PathBuf>()
-        .to_string_lossy()
-        .to_string()
-}
-
-fn package_name(repo_path: &Path) -> Option<String> {
-    let pubspec_path = repo_path.join("pubspec.yaml");
-    let content = std::fs::read_to_string(pubspec_path).ok()?;
-    content.lines().find_map(|line| {
-        let trimmed = line.trim();
-        trimmed
-            .strip_prefix("name:")
-            .map(|name| name.trim().trim_matches('"').trim_matches('\'').to_string())
-            .filter(|name| !name.is_empty())
-    })
-}
-
-fn normalize_import_uri(
-    repo_path: &Path,
-    base_file: &Path,
-    uri: &str,
-    package_name: Option<&str>,
-) -> Option<String> {
-    if uri.starts_with("dart:") {
-        return None;
-    }
-    if let Some(rest) = uri.strip_prefix("package:") {
-        let (package, relative) = rest.split_once('/')?;
-        if Some(package) != package_name {
-            return None;
-        }
-        return Some(
-            repo_path
-                .join("lib")
-                .join(relative)
-                .to_string_lossy()
-                .to_string(),
-        );
-    }
-    Some(
-        repo_path
-            .join(normalize_relative_uri(base_file, uri))
-            .to_string_lossy()
-            .to_string(),
-    )
-}
-
-fn build_audit_analysis(
-    repo_path: &Path,
-    manifest: &std::collections::HashMap<String, String>,
-) -> AuditFileAnalysis {
-    let mut analysis = AuditFileAnalysis::default();
-    let mut seen_decls = HashSet::new();
-    let repo_package_name = package_name(repo_path);
-
-    for path_str in manifest.keys() {
-        let file_path = Path::new(path_str);
-        let content = match std::fs::read_to_string(file_path) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        let display_file = relative_display_path(repo_path, file_path);
-
-        let chunker = compas::chunker::dart::DartChunker;
-        let chunks = match compas::chunker::Chunker::chunk(&chunker, path_str, &content) {
-            Ok(chunks) => chunks,
-            Err(_) => continue,
-        };
-
-        for chunk in chunks {
-            let symbol = strip_part_suffix(&chunk.symbol);
-            let is_filename_placeholder =
-                chunk.kind == "declaration" && symbol == audit_path_filename(path_str);
-            if chunk.kind == "file" || symbol.contains("unknown") || is_filename_placeholder {
-                continue;
-            }
-            if seen_decls.insert(format!("{}:{}:{}", path_str, symbol, chunk.kind)) {
-                analysis.declarations.push(AuditDeclaration {
-                    file: path_str.clone(),
-                    display_file: display_file.clone(),
-                    symbol,
-                    kind: chunk.kind,
-                });
-            }
-        }
-
-        if let Ok(semantic) = extract_semantic_references(&content) {
-            analysis
-                .references
-                .extend(
-                    semantic
-                        .references
-                        .into_iter()
-                        .map(|(_, callee)| AuditReference {
-                            caller_file: path_str.clone(),
-                            callee,
-                        }),
-                );
-            analysis.key_types.extend(semantic.key_types);
-            analysis
-                .file_edges
-                .extend(semantic.import_uris.into_iter().filter_map(|uri| {
-                    normalize_import_uri(repo_path, file_path, &uri, repo_package_name.as_deref())
-                        .map(|target| (path_str.clone(), target))
-                }));
-        }
-    }
-
-    analysis.key_types.sort();
-    analysis.key_types.dedup();
-    analysis.file_edges.sort();
-    analysis.file_edges.dedup();
-    analysis
-}
-
-#[allow(dead_code)]
-fn reachable_files(
-    manifest: &std::collections::HashMap<String, String>,
-    analysis: &AuditFileAnalysis,
-) -> HashSet<String> {
-    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
-    for path in manifest.keys() {
-        adjacency.entry(path.clone()).or_default();
-    }
-    for reference in &analysis.references {
-        if let Some(target) = resolve_reference_file(&reference.callee, &analysis.declarations) {
-            adjacency
-                .entry(reference.caller_file.clone())
-                .or_default()
-                .push(target);
-        }
-    }
-    for (source, target) in &analysis.file_edges {
-        adjacency
-            .entry(source.clone())
-            .or_default()
-            .push(target.clone());
-        adjacency.entry(target.clone()).or_default();
-    }
-
-    let mut inbound_counts: HashMap<String, usize> = HashMap::new();
-    for (source, targets) in &adjacency {
-        inbound_counts.entry(source.clone()).or_insert(0);
-        for target in targets {
-            *inbound_counts.entry(target.clone()).or_insert(0) += 1;
-        }
-    }
-
-    let mut queue = VecDeque::new();
-    let mut reachable = HashSet::new();
-    for path in manifest.keys() {
-        if inbound_counts.get(path).copied().unwrap_or(0) == 0 {
-            queue.push_back(path.clone());
-        }
-    }
-
-    while let Some(path) = queue.pop_front() {
-        if !reachable.insert(path.clone()) {
-            continue;
-        }
-        if let Some(targets) = adjacency.get(&path) {
-            for target in targets {
-                if manifest.contains_key(target) {
-                    queue.push_back(target.clone());
-                }
-            }
-        }
-    }
-
-    reachable
-}
-
-#[allow(dead_code)]
-fn resolve_reference_file(callee: &str, declarations: &[AuditDeclaration]) -> Option<String> {
-    declarations
-        .iter()
-        .find(|decl| decl.symbol == callee || decl.symbol.rsplit('.').next() == Some(callee))
-        .map(|decl| decl.file.clone())
-}
-
-fn classify_dead_code_candidates(analysis: &AuditFileAnalysis) -> Vec<DeadCodeCandidate> {
-    // Build a global bare-name set of every callee referenced anywhere.
-    // If a name appears in any reference, every declaration with that bare name
-    // is considered live. This is intentionally permissive: false negatives
-    // (missing a real dead method that shares a name with a live one) are far
-    // less costly than the false positives we get from precise matching when
-    // Dart's dynamic dispatch hides receiver types.
-    let mut referenced_names: HashSet<String> = HashSet::new();
-    for reference in &analysis.references {
-        // Record both the full callee and its last segment.
-        referenced_names.insert(reference.callee.clone());
-        if let Some(bare) = reference.callee.rsplit('.').next() {
-            referenced_names.insert(bare.to_string());
-        }
-    }
-
-    let key_types: HashSet<String> = analysis.key_types.iter().cloned().collect();
-    let mut candidates = vec![];
-
-    for declaration in &analysis.declarations {
-        // Skip declaration-level wrappers and types — we only care about callable members.
-        if matches!(
-            declaration.kind.as_str(),
-            "class" | "mixin" | "extension" | "enum" | "file" | "typedef"
-        ) {
-            continue;
-        }
-
-        // Skip filename-placeholder declarations from the chunker.
-        if declaration.kind == "declaration"
-            && declaration.symbol == audit_path_filename(&declaration.file)
-        {
-            continue;
-        }
-        if declaration.symbol.contains("unknown") {
-            continue;
-        }
-
-        let member_name = declaration
-            .symbol
-            .rsplit('.')
-            .next()
-            .unwrap_or(&declaration.symbol);
-        let enclosing_type = declaration
-            .symbol
-            .split('.')
-            .next()
-            .unwrap_or(&declaration.symbol);
-
-        // Hard suppressions: framework dispatch.
-        if is_framework_dispatched(member_name) {
-            continue;
-        }
-
-        // operator == / hashCode are framework-dispatched anyway, but as a belt-and-braces
-        // also suppress them whenever the enclosing class is used as a Map/Set key.
-        if (member_name == "operator ==" || member_name == "hashCode")
-            && key_types.contains(enclosing_type)
-        {
-            continue;
-        }
-
-        // Skip private members entirely. They are by definition internal to the file
-        // and the audit produces too much noise on `_buildRow`-style helpers.
-        if member_name.starts_with('_') {
-            continue;
-        }
-
-        // Skip getters and setters. They are read via property syntax that we cannot
-        // reliably distinguish from random identifier reads, so the signal is weak.
-        if declaration.kind == "getter_setter" {
-            continue;
-        }
-
-        // Skip constructors named like codegen entrypoints (fromJson, fromMap, etc.).
-        // These are matched above in is_framework_dispatched, but the constructor symbol
-        // is `Class.fromJson` so check the member_name explicitly too.
-        if matches!(declaration.kind.as_str(), "constructor")
-            && matches!(
-                member_name,
-                "fromJson" | "fromMap" | "fromSnapshot" | "fromDoc" | "fromDocument" | "fromString"
-            )
-        {
-            continue;
-        }
-
-        // Skip the unnamed default constructor (symbol like `Class.Class`) when the class
-        // itself is referenced anywhere by name. A class being instantiated (`Foo()`)
-        // shows up in references as the bare name `Foo`.
-        if declaration.kind == "constructor"
-            && member_name == enclosing_type
-            && referenced_names.contains(enclosing_type)
-        {
-            continue;
-        }
-
-        // Skip Flutter callback-style members (onPressed, onTap, etc.) — these are passed
-        // as widget parameters and dispatched by the framework.
-        if FLUTTER_CALLBACK_SUFFIXES.contains(&member_name) {
-            continue;
-        }
-
-        // Final liveness check: is the bare name referenced anywhere?
-        if referenced_names.contains(member_name) {
-            continue;
-        }
-
-        candidates.push(DeadCodeCandidate {
-            file: declaration.display_file.clone(),
-            symbol: declaration.symbol.clone(),
-            kind: declaration.kind.clone(),
-        });
-    }
-
-    candidates.sort_by(|a, b| a.file.cmp(&b.file).then(a.symbol.cmp(&b.symbol)));
-    candidates
 }
 
 async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
@@ -1022,11 +598,9 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     let pb = if use_tui {
         let bar = ProgressBar::new(files_with_hashes.len() as u64);
         bar.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
+            ProgressStyle::with_template(&progress_bar_template())
+                .unwrap()
+                .progress_chars("=>-"),
         );
         bar.set_message("starting...");
         Some(bar)
@@ -1039,8 +613,6 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut total_chunks = 0usize;
-    let mut chunks_without_docs: Vec<(String, String, String, usize)> = vec![];
-    let mut processed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (path, hash) in &files_with_hashes {
         let path_str = path.to_string_lossy().to_string();
@@ -1157,20 +729,6 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
                     );
                 }
             }
-            if !chunk.content.starts_with("///")
-                && !chunk.content.starts_with("//!")
-                && (chunk.kind == "method"
-                    || chunk.kind == "function"
-                    || chunk.kind == "constructor")
-                && !is_flutter_boilerplate(&chunk.symbol)
-            {
-                chunks_without_docs.push((
-                    rel_str.clone(),
-                    chunk.symbol.clone(),
-                    chunk.kind.clone(),
-                    chunk.line_start,
-                ));
-            }
         }
 
         if let Err(e) = store.delete_by_file(path.to_str().unwrap()).await {
@@ -1241,59 +799,11 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         processed += 1;
         total_chunks += chunks.len();
         new_manifest.insert(path_str.clone(), hash.clone());
-        processed_paths.insert(path_str);
 
         if let Some(ref bar) = pb {
             bar.inc(1);
         } else {
             info!("  ✓ done ({} chunks)", chunks.len());
-        }
-    }
-
-    // Scan unprocessed (unchanged) files for missing docs so audit is complete
-    for path_str in new_manifest.keys() {
-        if processed_paths.contains(path_str) {
-            continue;
-        }
-        let path = std::path::Path::new(path_str);
-        let relative = path.strip_prefix(&repo_path).unwrap_or(path);
-        let rel_str = relative.to_string_lossy().to_string();
-
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let language = match language_for_path(path) {
-            Some(language) => language,
-            None => continue,
-        };
-
-        let chunker = match registry.get(language) {
-            Some(chunker) => chunker,
-            None => continue,
-        };
-
-        let chunks = match chunker.chunk(path_str, &content) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        for chunk in &chunks {
-            if !chunk.content.starts_with("///")
-                && !chunk.content.starts_with("//!")
-                && (chunk.kind == "method"
-                    || chunk.kind == "function"
-                    || chunk.kind == "constructor")
-                && !is_flutter_boilerplate(&chunk.symbol)
-            {
-                chunks_without_docs.push((
-                    rel_str.clone(),
-                    chunk.symbol.clone(),
-                    chunk.kind.clone(),
-                    chunk.line_start,
-                ));
-            }
         }
     }
 
@@ -1312,24 +822,6 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         .await
         .ok();
     graph.save(&graph_path)?;
-
-    let dart_manifest: std::collections::HashMap<String, String> = new_manifest
-        .iter()
-        .filter(|(path, _)| language_for_path(Path::new(path)) == Some("dart"))
-        .map(|(path, hash)| (path.clone(), hash.clone()))
-        .collect();
-
-    let audit_analysis = build_audit_analysis(&repo_path, &dart_manifest);
-    let dead_code_candidates = classify_dead_code_candidates(&audit_analysis);
-
-    generate_audit(
-        &graph,
-        &dead_code_candidates,
-        &chunks_without_docs,
-        processed,
-        total_chunks,
-        failed,
-    );
 
     // Save manifest
     let manifest_json = serde_json::to_string_pretty(&new_manifest)?;
@@ -1350,19 +842,6 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
 
-    let dead_code_count = dead_code_candidates.len();
-
-    println!();
-    println!("     @@@@@@@   @@@@@@   @@@@@@@@@@   @@@@@@@    @@@@@@    @@@@@@   ");
-    println!("     @@@@@@@@  @@@@@@@@  @@@@@@@@@@@  @@@@@@@@  @@@@@@@@  @@@@@@@   ");
-    println!("     !@@       @@!  @@@  @@! @@! @@!  @@!  @@@  @@!  @@@  !@@       ");
-    println!("     !@!       !@!  @!@  !@! !@! !@!  !@!  @!@  !@!  @!@  !@!       ");
-    println!("     !@!       @!@  !@!  @!! !!@ @!@  @!@@!@!   @!@!@!@!  !!@@!!    ");
-    println!("     !!!       !@!  !!!  !@!   ! !@!  !!@!!!    !!!@!!!!   !!@!!!   ");
-    println!("     :!!       !!:  !!!  !!:     !!:  !!:       !!:  !!!       !:!  ");
-    println!("     :!:       :!:  !:!  :!:     :!:  :!:       :!:  !:!      !:!   ");
-    println!("      ::: :::  ::::: ::  :::     ::    ::       ::   :::  :::: ::   ");
-    println!("      :: :: :   : :  :    :      :     :         :   : :  :: : :    ");
     println!();
     println!("    {} indexed in {}", repo_name, time_str);
     println!();
@@ -1376,14 +855,7 @@ async fn index_repo(config: AppConfig) -> anyhow::Result<()> {
     println!("     {} chunks  ·  {} failed", total_chunks, failed);
     println!("    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
-    println!(
-        "    ⚠️  {} symbols missing doc comments",
-        chunks_without_docs.len()
-    );
-    println!("    🪦  {} dead code candidates", dead_code_count);
-    println!();
     println!("    📊 Graph  → {}", graph_path.display());
-    println!("    📋 Audit  → .compas/audit.md");
     println!();
 
     if !use_tui {
@@ -1434,60 +906,21 @@ async fn run_mcp() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut repos = HashMap::new();
-    let mut embedder_cache: HashMap<
-        compas::config::EmbedderConfig,
-        Arc<dyn compas::embedder::Embedder>,
-    > = HashMap::new();
+    let embedder_cache: Arc<
+        std::sync::Mutex<
+            HashMap<compas::config::EmbedderConfig, Arc<dyn compas::embedder::Embedder>>,
+        >,
+    > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let mut repos: HashMap<String, compas::mcp::state::RepoState> = HashMap::new();
     for (name, path) in registry.list() {
-        let config_path = std::path::Path::new(path).join("compas.yaml");
-        if !config_path.exists() {
-            warn!(
-                "compas.yaml not found for repo '{}' at {}, skipping",
-                name, path
-            );
-            continue;
-        }
-
-        let config = match AppConfig::load(config_path.to_str().unwrap()) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("failed to load config for repo '{}': {}", name, e);
-                continue;
+        match compas::mcp::state::load_repo_state(name, path, &embedder_cache) {
+            Ok(Some(state)) => {
+                repos.insert(name.clone(), state);
+                info!("loaded repo '{}' for MCP", name);
             }
-        };
-
-        let repo_path = std::fs::canonicalize(path)?;
-        let embedder = match embedder_cache.get(&config.embedder) {
-            Some(e) => Arc::clone(e),
-            None => {
-                let e = build_embedder(&config.embedder)?;
-                embedder_cache.insert(config.embedder.clone(), Arc::clone(&e));
-                e
-            }
-        };
-        let edge_store = Arc::new(EdgeStore::new(
-            repo_path.join(&config.store.path),
-            &config.store.vector_name,
-        ));
-        // MCP startup only loads repo descriptors. The shard is opened on demand
-        // when a tool call actually targets this repo.
-        let store: Arc<dyn compas::store::Store> = edge_store;
-        let graph = Arc::new(Graph::new());
-        let graph_path = repo_path.join(".compas").join("graph.json");
-        if let Err(e) = graph.load(&graph_path) {
-            warn!("no existing graph loaded for repo '{}': {}", name, e);
+            Ok(None) => {}
+            Err(e) => warn!("failed to load config for repo '{}': {}", name, e),
         }
-
-        repos.insert(
-            name.clone(),
-            compas::mcp::state::RepoState {
-                store,
-                graph,
-                embedder,
-            },
-        );
-        info!("loaded repo '{}' for MCP", name);
     }
 
     if repos.is_empty() {
@@ -1502,8 +935,9 @@ async fn run_mcp() -> anyhow::Result<()> {
     };
 
     let state = Arc::new(McpAppState {
-        repos,
+        repos: Arc::new(std::sync::RwLock::new(repos)),
         default_repo,
+        embedder_cache,
     });
 
     mcp::server::run_stdio_server(state).await
@@ -1793,153 +1227,6 @@ impl Handler for ReindexHandler {
     }
 }
 
-fn generate_audit(
-    _graph: &Graph,
-    dead_code: &[DeadCodeCandidate],
-    missing_docs: &[(String, String, String, usize)],
-    files: usize,
-    chunks: usize,
-    failed: usize,
-) {
-    // Deduplicate missing docs by base symbol (strip _pN suffix from split chunks).
-    // A large function split into _p1, _p2, _p3 should only appear once in the audit.
-    let mut seen_symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut deduped_docs: Vec<(String, String, String, usize)> = vec![];
-    for (file, symbol, kind, line) in missing_docs.iter() {
-        let base = strip_part_suffix(symbol);
-        if seen_symbols.insert(format!("{}:{}", file, base)) {
-            deduped_docs.push((file.clone(), base, kind.clone(), *line));
-        }
-    }
-    let mut missing_docs = deduped_docs;
-    missing_docs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut md = String::new();
-    md.push_str("# Compas Codebase Audit\n\n");
-    md.push_str(&format!(
-        "**Files indexed:** {} | **Chunks:** {} | **Failed:** {}\n\n",
-        files, chunks, failed
-    ));
-    md.push_str(&format!(
-        "**Symbols missing doc comments:** {} | **Dead code candidates:** {}\n\n",
-        missing_docs.len(),
-        dead_code.len()
-    ));
-
-    // Doc comments section — formatted as a self-contained AI agent prompt
-    md.push_str("---\n\n");
-    md.push_str("# PROMPT FOR YOUR AGENT: Add Dart Doc Comments\n\n");
-    md.push_str(
-        "Copy this entire section below to your AI agent. Do not edit the prompt itself.\n\n",
-    );
-    md.push_str("## Role\n\n");
-    md.push_str("You are a **Dart code documentation specialist**. Your sole task is to add `///` doc comments to the functions listed below.\n\n");
-    md.push_str("## Why This Matters\n\n");
-    md.push_str("These functions are **invisible to semantic search** because they lack `///` doc comments.\n");
-    md.push_str("This codebase is indexed by an AI search engine that embeds doc comments alongside code.\n");
-    md.push_str("When a developer searches \"where is the login authentication logic?\", the engine matches\n");
-    md.push_str("their query against these doc comments. **No comment = no match = the function might as well not exist.**\n\n");
-    md.push_str("## How to Write Good Doc Comments\n\n");
-    md.push_str(
-        "Write **1-3 lines** maximum. Include keywords a developer would actually search for.\n\n",
-    );
-    md.push_str("**Examples:**\n");
-    md.push_str("```dart\n");
-    md.push_str(
-        "/// Authenticates the user against the OAuth provider and stores the JWT token.\n",
-    );
-    md.push_str("/// Called during app startup and after token refresh.\n");
-    md.push_str("Future<void> authenticateUser() async { ... }\n");
-    md.push_str("```\n\n");
-    md.push_str("```dart\n");
-    md.push_str("/// Converts a Supabase JSON map into a [User] model.\n");
-    md.push_str("/// Handles null safety and default values for optional fields.\n");
-    md.push_str("factory User.fromSupabase(Map<String, dynamic> json) { ... }\n");
-    md.push_str("```\n\n");
-    md.push_str("**Rules for wording:**\n");
-    md.push_str("- Use the **domain vocabulary** from the codebase (e.g., \"auth\", \"cache\", \"payment\")\n");
-    md.push_str("- Mention **what the function returns** for getters and factory constructors\n");
-    md.push_str("- Mention **when/where it is called** if it's a lifecycle or callback method\n");
-    md.push_str(
-        "- Mention **side effects** (e.g., \"updates local cache\", \"writes to Supabase\")\n",
-    );
-    md.push_str("- **Do NOT** describe implementation details (\"loops over list\", \"uses a forEach\")\n\n");
-    md.push_str("## CRITICAL CONSTRAINTS — DO NOT VIOLATE\n\n");
-    md.push_str("1. **DO NOT modify any code.** Only add `///` lines immediately before the function declaration.\n");
-    md.push_str("2. **DO NOT change signatures, logic, imports, or formatting.**\n");
-    md.push_str("3. **DO NOT use `//` comments.** Only `///` doc comments are indexed.\n");
-    md.push_str(
-        "4. **DO NOT add comments inside function bodies.** Only top-of-function doc comments.\n",
-    );
-    md.push_str("5. **DO NOT delete, move, or rename any functions.**\n");
-    md.push_str("6. **Keep each comment under 200 characters.** Prefer 1-2 lines.\n");
-    md.push_str("7. **DO NOT add comments to Flutter `build()` methods** unless they contain complex business logic.\n\n");
-    md.push_str("## IMPORTANT — TAKE THIS SERIOUSLY\n\n");
-    md.push_str("This is a **production codebase**. Vague, generic, or placeholder comments (e.g., \"This method does something\")\n");
-    md.push_str("will get you fired.\n\n");
-    md.push_str("A very important search tool will depend on these comments, you will prioritize quality over speed. No one will be expecting for you finish fast, take your time.\n");
-    md.push_str("Write comments that **you** would find useful 6 months from now when you're debugging at 2am.\n\n");
-    md.push_str("If you are unsure what a function does, infer from:\n");
-    md.push_str("- Its name and parameters\n");
-    md.push_str("- The class it belongs to\n");
-    md.push_str("- Other functions called inside its body\n");
-    md.push_str("- The file it lives in (e.g., `book_service.dart` implies database/network operations)\n\n");
-    md.push_str("---\n\n");
-    md.push_str("## Functions Requiring Doc Comments\n\n");
-    md.push_str("Work through this list file by file. For each entry, locate the function at the given line and add a `///` doc comment.\n\n");
-    if missing_docs.is_empty() {
-        md.push_str("*All methods and functions have doc comments!* 🎉\n\n");
-    } else {
-        md.push_str("| File | Symbol | Kind | Approx. Line |\n");
-        md.push_str("|------|--------|------|-------------|\n");
-        for (file, symbol, kind, line) in &missing_docs {
-            md.push_str(&format!(
-                "| {} | {} | {} | ~{} |\n",
-                file, symbol, kind, line
-            ));
-        }
-        md.push('\n');
-    }
-    md.push_str("---\n\n");
-
-    // Dead code section
-    md.push_str("## Potentially Dead Code\n\n");
-    md.push_str(
-        "These declarations have no inbound semantic references after framework dispatch,\n",
-    );
-    md.push_str(
-        "Dart protocol, getter, and codegen suppressions. Each entry is worth a human review;\n",
-    );
-    md.push_str("private helpers, lifecycle methods, and serialization hooks are excluded.\n\n");
-    if dead_code.is_empty() {
-        md.push_str("*No dead code candidates found!* 🎉\n");
-    } else {
-        md.push_str("| File | Symbol | Kind |\n");
-        md.push_str("|------|--------|------|\n");
-        for candidate in dead_code {
-            md.push_str(&format!(
-                "| {} | {} | {} |\n",
-                candidate.file, candidate.symbol, candidate.kind
-            ));
-        }
-    }
-
-    // Write to .compas/audit.md
-    if let Ok(repo_path) = std::fs::canonicalize(std::env::current_dir().unwrap_or_default()) {
-        let audit_path = repo_path.join(".compas").join("audit.md");
-        if let Ok(dir) = audit_path
-            .parent()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no parent"))
-        {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match std::fs::write(&audit_path, &md) {
-            Ok(_) => info!("wrote audit report to .compas/audit.md"),
-            Err(e) => warn!("failed to write audit report: {}", e),
-        }
-    }
-}
-
 /// Strip the `_pN` suffix added by the chunker when splitting large chunks.
 /// This ensures graph symbols match the names returned by extract_calls.
 fn strip_part_suffix(symbol: &str) -> String {
@@ -1983,6 +1270,7 @@ fn should_include(path: &std::path::Path, include: &[String], exclude: &[String]
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::path::Path;
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2011,261 +1299,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("server did not become ready on port {port}");
-    }
-
-    fn decl(file: &str, symbol: &str, kind: &str) -> AuditDeclaration {
-        AuditDeclaration {
-            file: file.into(),
-            display_file: file.into(),
-            symbol: symbol.into(),
-            kind: kind.into(),
-        }
-    }
-
-    fn reference(caller_file: &str, callee: &str) -> AuditReference {
-        AuditReference {
-            caller_file: caller_file.into(),
-            callee: callee.into(),
-        }
-    }
-
-    #[test]
-    fn test_bare_name_match_credits_all_same_named_declarations() {
-        // If `loadUsers` is called anywhere, every declaration named `loadUsers`
-        // is considered live — even if the call is on a variable whose type we
-        // cannot resolve (the common Dart case with Riverpod providers).
-        let analysis = AuditFileAnalysis {
-            declarations: vec![
-                decl(
-                    "lib/management/service_user_management.dart",
-                    "UserManagementService.loadUsers",
-                    "method",
-                ),
-                decl(
-                    "lib/admin/service_admin.dart",
-                    "AdminService.loadUsers",
-                    "method",
-                ),
-            ],
-            references: vec![reference(
-                "lib/management/provider_user_management.dart",
-                "loadUsers",
-            )],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert!(
-            candidates.is_empty(),
-            "Expected bare-name match to credit all `loadUsers` declarations, got: {candidates:?}"
-        );
-    }
-
-    #[test]
-    fn test_lifecycle_methods_are_hard_suppressed() {
-        let analysis = AuditFileAnalysis {
-            declarations: vec![
-                decl("lib/screen.dart", "MyScreen.createState", "method"),
-                decl("lib/screen.dart", "_MyScreenState.initState", "method"),
-                decl("lib/screen.dart", "_MyScreenState.build", "method"),
-                decl(
-                    "lib/widget.dart",
-                    "MyInherited.updateShouldNotify",
-                    "method",
-                ),
-            ],
-            references: vec![],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert!(
-            candidates.is_empty(),
-            "Expected lifecycle methods to be suppressed, got: {candidates:?}"
-        );
-    }
-
-    #[test]
-    fn test_main_function_is_suppressed() {
-        let analysis = AuditFileAnalysis {
-            declarations: vec![decl("lib/main.dart", "main", "function")],
-            references: vec![],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert!(
-            candidates.is_empty(),
-            "Expected `main` to be suppressed, got: {candidates:?}"
-        );
-    }
-
-    #[test]
-    fn test_codegen_protocol_methods_are_suppressed() {
-        let analysis = AuditFileAnalysis {
-            declarations: vec![
-                decl("lib/model.dart", "User.fromJson", "constructor"),
-                decl("lib/model.dart", "User.toJson", "method"),
-                decl("lib/model.dart", "User.toString", "method"),
-                decl("lib/model.dart", "User.hashCode", "getter_setter"),
-                decl("lib/model.dart", "User.operator ==", "method"),
-            ],
-            references: vec![],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert!(
-            candidates.is_empty(),
-            "Expected protocol/codegen methods to be suppressed, got: {candidates:?}"
-        );
-    }
-
-    #[test]
-    fn test_private_members_are_suppressed() {
-        let analysis = AuditFileAnalysis {
-            declarations: vec![
-                decl("lib/widget.dart", "MyWidget._buildRow", "method"),
-                decl("lib/util.dart", "_internalHelper", "function"),
-            ],
-            references: vec![],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert!(
-            candidates.is_empty(),
-            "Expected private members to be suppressed, got: {candidates:?}"
-        );
-    }
-
-    #[test]
-    fn test_default_constructor_skipped_when_class_referenced() {
-        // `HolidayService()` shows up in references as just `HolidayService`,
-        // and the default constructor is keyed as `HolidayService.HolidayService`.
-        let analysis = AuditFileAnalysis {
-            declarations: vec![decl(
-                "lib/service.dart",
-                "HolidayService.HolidayService",
-                "constructor",
-            )],
-            references: vec![reference("lib/provider.dart", "HolidayService")],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert!(
-            candidates.is_empty(),
-            "Expected default constructor to be alive when class is referenced, got: {candidates:?}"
-        );
-    }
-
-    #[test]
-    fn test_truly_unreferenced_method_is_flagged() {
-        let analysis = AuditFileAnalysis {
-            declarations: vec![decl("lib/abandoned.dart", "AbandonedService.run", "method")],
-            references: vec![reference("lib/other.dart", "somethingElse")],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert_eq!(
-            candidates.len(),
-            1,
-            "Expected exactly one candidate, got: {candidates:?}"
-        );
-        assert_eq!(candidates[0].symbol, "AbandonedService.run");
-    }
-
-    #[test]
-    fn test_filename_placeholder_declarations_are_skipped() {
-        let analysis = AuditFileAnalysis {
-            declarations: vec![AuditDeclaration {
-                file: "lib/core/providers/provider_auth.dart".into(),
-                display_file: "lib/core/providers/provider_auth.dart".into(),
-                symbol: "provider_auth.dart".into(),
-                kind: "declaration".into(),
-            }],
-            references: vec![],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert!(
-            candidates.is_empty(),
-            "Expected no candidates, got: {candidates:?}"
-        );
-    }
-
-    #[test]
-    fn test_getter_setter_kind_is_skipped() {
-        let analysis = AuditFileAnalysis {
-            declarations: vec![decl("lib/svc.dart", "Service.someGetter", "getter_setter")],
-            references: vec![],
-            file_edges: vec![],
-            key_types: vec![],
-        };
-
-        let candidates = classify_dead_code_candidates(&analysis);
-        assert!(
-            candidates.is_empty(),
-            "Expected getter_setter to be suppressed, got: {candidates:?}"
-        );
-    }
-
-    #[test]
-    fn test_normalize_import_uri_returns_manifest_style_absolute_paths() {
-        let repo_path = Path::new("/repo");
-        let base_file = Path::new("/repo/lib/main.dart");
-
-        assert_eq!(
-            normalize_import_uri(
-                repo_path,
-                base_file,
-                "package:tyoajanseuranta/core/providers/provider_auth.dart",
-                Some("tyoajanseuranta"),
-            ),
-            Some("/repo/lib/core/providers/provider_auth.dart".to_string())
-        );
-        assert_eq!(
-            normalize_import_uri(repo_path, base_file, "auth/screen_login.dart", None),
-            Some("/repo/lib/auth/screen_login.dart".to_string())
-        );
-    }
-
-    #[test]
-    fn test_reachable_files_follow_package_local_imports() {
-        // Reachability is no longer used by dead-code classification, but the
-        // helper is kept around for potential future "orphan files" reporting.
-        let analysis = AuditFileAnalysis {
-            declarations: vec![],
-            references: vec![],
-            file_edges: vec![(
-                "/repo/lib/main.dart".into(),
-                "/repo/lib/core/providers/provider_auth.dart".into(),
-            )],
-            key_types: vec![],
-        };
-
-        let manifest = HashMap::from([
-            ("/repo/lib/main.dart".to_string(), "hash1".to_string()),
-            (
-                "/repo/lib/core/providers/provider_auth.dart".to_string(),
-                "hash2".to_string(),
-            ),
-        ]);
-        let reachable = reachable_files(&manifest, &analysis);
-
-        assert!(reachable.contains("/repo/lib/main.dart"));
-        assert!(reachable.contains("/repo/lib/core/providers/provider_auth.dart"));
     }
 
     #[tokio::test]

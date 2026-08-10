@@ -117,6 +117,20 @@ Repos are registered in `~/.config/compas/repos.json`.
 
 Indexing is incremental, unchanged files are skipped on reindex.
 
+## Better Dart Results
+
+If you're indexing a Dart or Flutter project, turn on the analyzer lint that already tracks missing public docs:
+
+```yaml
+linter:
+  rules:
+    public_member_api_docs: true
+```
+
+Then add real `///` doc comments to public APIs. Compas indexes those comments alongside code, so good doc comments improve search recall and make natural-language queries more likely to hit the right symbol.
+
+Best results come from short, concrete comments that use the same domain words a developer would search for.
+
 **Why local-first:** Your code never leaves your machine. No API keys, no rate limits, no vendor lock-in.
 
 ## Language Support

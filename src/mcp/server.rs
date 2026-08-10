@@ -252,15 +252,16 @@ mod tests {
         graph.add_symbol("AuthService.login", "/tmp/lib/auth_service.dart", "method");
 
         let state = Arc::new(McpAppState {
-            repos: HashMap::from([(
+            repos: Arc::new(std::sync::RwLock::new(HashMap::from([(
                 "test-repo".to_string(),
                 RepoState {
                     store: store_impl.clone() as Arc<dyn Store>,
                     graph,
                     embedder: Arc::new(FakeEmbedder),
                 },
-            )]),
+            )]))),
             default_repo: Some("test-repo".to_string()),
+            embedder_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let request = JsonRpcRequest {

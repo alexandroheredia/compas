@@ -161,15 +161,13 @@ Indexing /path/to/my-repo  (52 files, 0 changed, 0 deleted)
      520 chunks  ·  0 failed
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    ⚠️  107 symbols missing doc comments
-    🪦  21 dead code candidates
-
     📊 Graph  → /path/to/my-repo/.compas/graph.json
-    📋 Audit  → .compas/audit.md
 
 Optimizing edge shard...
 ✓ Edge shard optimized
 ```
+
+For Dart and Flutter repos, enable `public_member_api_docs: true` in your analyzer settings and add `///` doc comments to public APIs. Compas embeds those comments with the code, so they materially improve semantic search quality.
 
 ### Step 6: Start the HTTP Server (Optional — Debugging Only)
 
@@ -293,7 +291,6 @@ curl "http://localhost:3001/search?repo=repo2&q=cache+logic"
 | `{repo}/compas.yaml`           | Per-repo configuration                      |
 | `{repo}/.compas/edge-shard/`   | Embedded Qdrant Edge shard                  |
 | `{repo}/.compas/graph.json`    | Symbol call graph                           |
-| `{repo}/.compas/audit.md`      | Code quality report                         |
 | `{repo}/.compas/manifest.json` | Incremental indexing manifest (file hashes) |
 
 ---

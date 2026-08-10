@@ -1,10 +1,11 @@
-use super::state::{McpAppState, RepoState};
+use super::state::McpAppState;
 use super::types::*;
 use crate::embedder::EmbedMode;
 use crate::models::SearchResult;
 use crate::search::rerank_results;
 use serde_json::json;
 use std::collections::HashMap;
+use tracing::{info, warn};
 
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
@@ -38,18 +39,19 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-fn resolve_repo<'a>(
-    state: &'a McpAppState,
+fn resolve_repo(
+    state: &McpAppState,
     args: &serde_json::Value,
-) -> Result<(&'a str, &'a RepoState), String> {
-    let repo_name = args["repo"]
+) -> Result<super::state::RepoState, String> {
+    let requested = args["repo"]
         .as_str()
         .map(|s| s.to_string())
         .or_else(|| {
             // Try to auto-detect from cwd
             let cwd = std::env::current_dir().ok()?;
             let cwd_lower = cwd.to_string_lossy().to_lowercase();
-            for name in state.repos.keys() {
+            let repos = state.repos.read().unwrap();
+            for name in repos.keys() {
                 // Case-insensitive heuristic: match if cwd contains the repo name
                 if cwd_lower.contains(&name.to_lowercase()) {
                     return Some(name.clone());
@@ -58,19 +60,62 @@ fn resolve_repo<'a>(
             state.default_repo.clone()
         })
         .ok_or_else(|| {
-            let available: Vec<String> = state.repos.keys().cloned().collect();
+            let available: Vec<String> = state.repos.read().unwrap().keys().cloned().collect();
             format!(
                 "missing 'repo' parameter and could not auto-detect from cwd. Available repos: {}",
                 available.join(", ")
             )
         })?;
 
-    state
-        .repos
+    // Fast path: the repo is already loaded in memory.
+    if let Some(repo) = lookup_loaded(state, &requested) {
+        return Ok(repo);
+    }
+
+    // Miss: a repo may have been registered via `compas init` after this MCP
+    // server started. Reload the on-disk registry and load it on demand.
+    let registry = crate::config::RepoRegistry::load();
+    if let Some((name, path)) = registry
+        .list()
+        .into_iter()
+        .find(|(n, _)| n.to_lowercase() == requested.to_lowercase())
+    {
+        match super::state::load_repo_state(name, path, &state.embedder_cache) {
+            Ok(Some(new_state)) => {
+                let mut repos = state.repos.write().unwrap();
+                // Another concurrent call may have loaded it first; prefer that.
+                if let Some(existing) = repos
+                    .iter()
+                    .find(|(n, _)| n.to_lowercase() == requested.to_lowercase())
+                    .map(|(n, _)| n.clone())
+                {
+                    return Ok(repos.get(&existing).unwrap().clone());
+                }
+                info!("lazy-loaded repo '{}' for MCP", name);
+                repos.insert(name.clone(), new_state.clone());
+                return Ok(new_state);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("failed to lazy-load repo '{}': {}", name, e),
+        }
+    }
+
+    let available: Vec<String> = state.repos.read().unwrap().keys().cloned().collect();
+    Err(format!(
+        "repo '{}' not found. Available repos: {}",
+        requested,
+        available.join(", ")
+    ))
+}
+
+/// Case-insensitive lookup against the in-memory repo map. Returns a cloned
+/// `RepoState` (all fields are `Arc`, so cloning is cheap).
+fn lookup_loaded(state: &McpAppState, requested: &str) -> Option<super::state::RepoState> {
+    let repos = state.repos.read().unwrap();
+    repos
         .iter()
-        .find(|(name, _)| name.to_lowercase() == repo_name.to_lowercase())
-        .map(|(name, repo)| (name.as_str(), repo))
-        .ok_or_else(|| format!("repo '{}' not found", repo_name))
+        .find(|(name, _)| name.to_lowercase() == requested.to_lowercase())
+        .map(|(_, repo)| repo.clone())
 }
 
 pub async fn handle_tool_call(
@@ -93,7 +138,7 @@ async fn handle_search(
     let limit = args["limit"].as_u64().unwrap_or(10) as usize;
     let language = args["language"].as_str();
 
-    let (_, repo) = resolve_repo(state, args)?;
+    let repo = resolve_repo(state, args)?;
 
     let embedding = repo
         .embedder
@@ -162,9 +207,7 @@ async fn handle_graph(
     let symbol = args["symbol"].as_str().ok_or("missing 'symbol' argument")?;
     let file = args["file"].as_str().unwrap_or("");
 
-    let (_, repo) = resolve_repo(state, args)?;
-
-    // Try exact lookup first
+    let repo = resolve_repo(state, args)?;
     let exact = repo.graph.get(symbol, file);
 
     // If no exact match, try fuzzy search
@@ -213,7 +256,7 @@ mod tests {
     use crate::store::Store;
     use anyhow::Result;
     use serde_json::json;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -265,15 +308,16 @@ mod tests {
             .unwrap();
 
         let state = McpAppState {
-            repos: HashMap::from([(
+            repos: Arc::new(std::sync::RwLock::new(HashMap::from([(
                 "bookswipe".to_string(),
                 RepoState {
                     store,
                     graph: Arc::new(Graph::new()),
                     embedder: Arc::new(FakeEmbedder),
                 },
-            )]),
+            )]))),
             default_repo: Some("bookswipe".to_string()),
+            embedder_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let result = handle_tool_call(

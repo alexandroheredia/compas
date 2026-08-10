@@ -10,13 +10,6 @@ It works like `.gitignore`: one glob pattern per line, `#` for comments, trailin
 matches the whole directory tree. Files matching any pattern are skipped during indexing
 and cleaned out of Qdrant and the symbol graph on the next reindex.
 
-The missing-docs audit no longer flags standard Flutter lifecycle methods (`build`,
-`createState`, `initState`, `dispose`, and friends) as missing documentation. They are
-framework boilerplate, not real findings.
-
-The missing-docs audit now covers the entire codebase. Previously, files that were
-unchanged since the last index were silently skipped during the audit pass.
-
 ## compas 2026.5.8
 
 Initial release.
@@ -27,4 +20,3 @@ Initial release.
 - Global multi-repo daemon (`compas serve`)
 - Incremental indexing with content hashing
 - Dart/Flutter chunker with doc comment enrichment
-- Code audit report (missing docs, dead code candidates)
